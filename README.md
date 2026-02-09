@@ -1,7 +1,7 @@
 # Repopulation_of_CAMs
 Code used to analyze data for "Distinct origins and niches determine the cellular responsiveness of CNS macrophages after repopulation"
 
-Its purpose is to provide explanation on how to reproduce key findings of this publication.
+Its purpose is to provide an explanation for how to reproduce key findings of this publication.
 
 Users need to install R programming language. It can be downloaded from: https://cran.r-project.org/
 
