@@ -1,0 +1,243 @@
+# =============================================================================
+# Bulk RNA-seq analysis pipeline for
+# Sorted CAMs (CD206+) from Mrc1creERT2xtdT 8w post depletion or control
+# Core DESeq2 differential expression, visualization, GO enrichment & PROGENy
+#
+# Requirements:
+#   - R >= 4.0
+#   - Install required packages: BiocManager::install(c("DESeq2", "apeglm", ...))
+#   - Input files:
+#       - counts matrix (tab-separated, genes as rows, samples as columns)
+#       - colData (sample metadata with columns: Sample, Condition)
+# =============================================================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Load libraries
+# ─────────────────────────────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggrepel)
+  library(apeglm)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(AnnotationDbi)
+  library(EnhancedVolcano)
+  library(progeny)
+  library(ggradar)
+  library(writexl)       # optional - for saving tables
+})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Load data (adjust paths or pass as arguments)
+# ─────────────────────────────────────────────────────────────────────────────
+# Example usage:
+#   counts_file <- "data/counts_for_analysis.txt"
+#   coldata_file <- "data/colData.txt"
+
+load_data <- function(counts_file, coldata_file) {
+  # Read raw counts (row.names = gene IDs, first column may be gene)
+  counts <- read.table(counts_file, header = TRUE, row.names = 1, sep = "\t", check.names = FALSE)
+  
+  # Read sample metadata
+  coldata <- read.table(coldata_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  
+  # Ensure matching order
+  common_samples <- intersect(colnames(counts), coldata$Sample)
+  if (length(common_samples) == 0) stop("No matching sample names between counts and colData")
+  
+  counts <- counts[, common_samples]
+  coldata <- coldata[match(common_samples, coldata$Sample), ]
+  rownames(coldata) <- coldata$Sample
+  
+  # Clean condition as factor
+  coldata$Condition <- factor(coldata$Condition, levels = c("CTL", "neg", "pos"))
+  
+  list(counts = counts, coldata = coldata)
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Create DESeq2 object & run analysis
+# ─────────────────────────────────────────────────────────────────────────────
+run_deseq <- function(counts, coldata) {
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(counts),   # ensure integer counts
+    colData   = coldata,
+    design    = ~ Condition
+  )
+  
+  # Minimal pre-filtering
+  keep <- rowSums(counts(dds) >= 10) >= 3
+  dds <- dds[keep, ]
+  
+  dds <- DESeq(dds)
+  
+  # Results with LFC shrinkage (apeglm)
+  res_neg_vs_CTL <- lfcShrink(dds, coef = "Condition_neg_vs_CTL", type = "apeglm")
+  res_pos_vs_CTL <- lfcShrink(dds, coef = "Condition_pos_vs_CTL", type = "apeglm")
+  
+  # Relevel to get neg vs pos
+  dds$Condition <- relevel(dds$Condition, ref = "pos")
+  dds <- nbinomWaldTest(dds)
+  res_neg_vs_pos <- lfcShrink(dds, coef = "Condition_neg_vs_pos", type = "apeglm")
+  
+  list(dds = dds, 
+       res_neg_vs_pos = res_neg_vs_pos,
+       res_pos_vs_CTL = res_pos_vs_CTL,
+       res_neg_vs_CTL = res_neg_vs_CTL)
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Basic QC plots
+# ─────────────────────────────────────────────────────────────────────────────
+plot_qc <- function(dds) {
+  vsd <- vst(dds, blind = TRUE)
+  
+  # PCA
+  pcaData <- plotPCA(vsd, intgroup = "Condition", returnData = TRUE, ntop = 1000)
+  percentVar <- round(100 * attr(pcaData, "percentVar"))
+  
+  p_pca <- ggplot(pcaData, aes(PC1, PC2, color = Condition)) +
+    geom_point(size = 3) +
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    ggtitle("PCA - VST transformed counts") +
+    geom_text_repel(aes(label = name), size = 3, max.overlaps = 20) +
+    theme_minimal()
+  
+  print(p_pca)
+  
+  # Most variable genes heatmap
+  top_var_genes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 1000)
+  pheatmap(assay(vsd)[top_var_genes, ],
+           scale = "row",
+           clustering_distance_rows = "euclidean",
+           clustering_distance_cols = "euclidean",
+           annotation_col = as.data.frame(colData(vsd)["Condition"]),
+           main = "Top 1000 most variable genes (VST, row-scaled)")
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Volcano & EnhancedVolcano
+# ─────────────────────────────────────────────────────────────────────────────
+plot_volcano <- function(res, contrast_name = "neg_vs_pos") {
+  res_df <- as.data.frame(res)
+  res_df$gene <- rownames(res_df)
+  
+  EnhancedVolcano(
+    res_df,
+    lab = res_df$gene,
+    x = "log2FoldChange",
+    y = "padj",
+    title = paste("Volcano -", contrast_name),
+    subtitle = NULL,
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 2.5,
+    labSize = 4.5,
+    legendPosition = "top",
+    col = c("grey30", "grey30", "royalblue", "green3")
+  )
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. GO enrichment (BP)
+# ─────────────────────────────────────────────────────────────────────────────
+run_go_enrichment <- function(res, contrast_name = "neg_vs_pos", pcut = 0.05, fccut = 1) {
+  sig_genes <- rownames(res)[res$padj < pcut & abs(res$log2FoldChange) > fccut & !is.na(res$padj)]
+  
+  if (length(sig_genes) < 3) {
+    message("Too few significant genes for GO enrichment.")
+    return(NULL)
+  }
+  
+  entrez <- mapIds(org.Mm.eg.db, keys = sig_genes, column = "ENTREZID", keytype = "SYMBOL")
+  entrez <- entrez[!is.na(entrez)]
+  
+  bg_genes <- rownames(res)
+  bg_entrez <- mapIds(org.Mm.eg.db, keys = bg_genes, column = "ENTREZID", keytype = "SYMBOL")
+  bg_entrez <- bg_entrez[!is.na(bg_entrez)]
+  
+  ego <- enrichGO(
+    gene          = entrez,
+    OrgDb         = org.Mm.eg.db,
+    universe      = bg_entrez,
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.2,
+    readable      = TRUE
+  )
+  
+  if (nrow(as.data.frame(ego)) > 0) {
+    print(dotplot(ego, showCategory = 15, title = paste("GO BP -", contrast_name)))
+  }
+  
+  ego
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Radar / Spider plot for selected marker genes
+# ─────────────────────────────────────────────────────────────────────────────
+plot_radar_markers <- function(dds) {
+  normalized <- counts(dds, normalized = TRUE)
+  
+  def_genes <- c("Ms4a7", "Apoe", "Pf4", "Igf1", "Clec10a", "P2rx7", "C4b", "Mrc1",
+                 "Colec12", "Timd4", "Folr2", "Cd163", "Lyve1", "Cd9", "Cd74",
+                 "H2-Aa", "H2-Ab1", "Fxyd5", "Lgals3", "Clec4b1", "Coro1a",
+                 "Ccr2", "Cd52", "Clec12a", "Lyz2")
+  
+  def_genes <- intersect(def_genes, rownames(normalized))
+  sel <- normalized[def_genes, , drop = FALSE]
+  
+  coldata <- as.data.frame(colData(dds))
+  conditions <- unique(coldata$Condition)
+  
+  mean_expr <- sapply(conditions, function(cond) {
+    samples <- coldata$Sample[coldata$Condition == cond]
+    rowMeans(sel[, samples, drop = FALSE])
+  })
+  
+  mean_df <- as.data.frame(t(mean_expr))
+  mean_df$Group <- rownames(mean_df)
+  
+  # Normalize to max = 1 per gene
+  radar_data <- mean_df %>% 
+    column_to_rownames("Group") %>%
+    mutate(across(everything(), ~ . / max(., na.rm = TRUE))) %>%
+    rownames_to_column("Group")
+  
+  ggradar(radar_data,
+          values.radar = c(0, 0.5, 1.25),
+          grid.mid = 0.5, grid.max = 1.25,
+          group.point.size = 2, group.line.width = 1,
+          group.colours = c("#00B8E7", "#7CAE00", "#F8766D"),
+          legend.text.size = 10) +
+    ggtitle("Marker Gene Expression Profiles by Condition")
+}
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main execution example
+# ─────────────────────────────────────────────────────────────────────────────
+# Uncomment and adjust paths when running
+
+# data <- load_data("counts_for_analysis.txt", "colData-4.txt")
+# dds_res <- run_deseq(data$counts, data$coldata)
+# dds <- dds_res$dds
+
+# plot_qc(dds)
+# plot_volcano(dds_res$res_neg_vs_pos, "neg_vs_pos")
+
+# go_neg_pos <- run_go_enrichment(dds_res$res_neg_vs_pos, "neg_vs_pos")
+# go_pos_ctl  <- run_go_enrichment(dds_res$res_pos_vs_CTL,  "pos_vs_CTL")
