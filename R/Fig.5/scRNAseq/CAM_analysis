@@ -1,0 +1,201 @@
+# =============================================================================
+# Project:   CAMs scRNA-seq – Sub-analysis of CAM population
+# Script:    Downstream_analysis_CAMs.R
+# Author:    Max Fliegauf
+# Date:      2024
+# Purpose:   Subset CAMs → re-process → integration → sub-clustering →
+#            differential expression → visualization → module scores → CellChat
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(gridExtra)
+  library(ggpubr)
+  library(rstatix)
+  library(VennDiagram)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(speckle)          # propeller
+  library(SingleCellExperiment)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/04_CAMs_only_analysis.R")   # recommended
+
+INPUT_RDS     <- here("results/rds/cso_integr.rds")
+OUTPUT_CAM_RDS <- here("results/rds/CAMs_integrated.rds")
+TABLES_DIR    <- here("results/tables")
+FIGURES_DIR   <- here("results/figures")
+
+dir.create(TABLES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+HVF_NFEATURES_CAM <- 2000
+PCA_DIMS_CAM      <- 1:20
+RES_CAM           <- 0.5
+RES_INTEGRATED_CAM <- 0.25
+
+EXCLUDE_PATTERNS  <- c("^mt-", "^Rp[sl][[:digit:]]", "^Rpsa", "tdTomato", "cre", "WPRE-QY")
+
+# ── 1. Load & subset CAMs ────────────────────────────────────────────────────
+iso <- readRDS(INPUT_RDS)
+Idents(iso) <- "cell_type"
+CAM <- subset(iso, idents = "CAM")
+
+cat("CAM subset contains", ncol(CAM), "cells\n")
+
+# Remove old integrated assay to force re-integration
+CAM[["integrated"]] <- NULL
+DefaultAssay(CAM) <- "RNA"
+
+# ── 2. Standard preprocessing on CAM subset ──────────────────────────────────
+CAM <- NormalizeData(CAM)
+CAM <- FindVariableFeatures(CAM, selection.method = "vst", nfeatures = HVF_NFEATURES_CAM)
+
+# Exclude unwanted genes from HVF
+var_features <- VariableFeatures(CAM)
+exclude <- grepl(paste(EXCLUDE_PATTERNS, collapse = "|"), rownames(CAM))
+VariableFeatures(CAM) <- var_features[!var_features %in% rownames(CAM)[exclude]]
+
+CAM <- ScaleData(CAM, features = VariableFeatures(CAM))
+CAM <- RunPCA(CAM, features = VariableFeatures(CAM))
+
+ElbowPlot(CAM, ndims = 40)   # decide on dims
+
+# ── 3. Initial clustering (pre-integration) ──────────────────────────────────
+CAM <- RunUMAP(CAM, dims = PCA_DIMS_CAM)
+CAM <- FindNeighbors(CAM, dims = PCA_DIMS_CAM)
+CAM <- FindClusters(CAM, resolution = RES_CAM)
+
+p_umap_pre <- DimPlot(CAM, label = TRUE) + ggtitle("CAMs pre-integration")
+p_cond_pre  <- DimPlot(CAM, group.by = "condition")
+p_batch_pre <- DimPlot(CAM, group.by = "batch_effect")
+p_umap_pre | p_cond_pre | p_batch_pre
+
+# ── 4. CCA integration across batch_effect ───────────────────────────────────
+obj_list <- SplitObject(CAM, split.by = "batch_effect")
+
+anchors <- FindIntegrationAnchors(
+  object.list = obj_list,
+  reduction   = "cca",
+  dims        = PCA_DIMS_CAM,
+  k.score     = 50,
+  max.features = HVF_NFEATURES_CAM
+)
+
+integrated <- IntegrateData(anchorset = anchors, dims = PCA_DIMS_CAM)
+
+CAM_int <- CAM
+CAM_int[["integrated"]] <- integrated[["integrated"]]
+DefaultAssay(CAM_int) <- "integrated"
+
+# Remove RNA assay if you really want to force integrated usage
+# CAM_int[["RNA"]] <- NULL
+
+# ── 5. Re-run dim reduction & clustering on integrated space ─────────────────
+CAM_int <- ScaleData(CAM_int)
+CAM_int <- RunPCA(CAM_int)
+CAM_int <- RunUMAP(CAM_int, dims = PCA_DIMS_CAM)
+CAM_int <- FindNeighbors(CAM_int, dims = PCA_DIMS_CAM)
+CAM_int <- FindClusters(CAM_int, resolution = RES_INTEGRATED_CAM)
+
+# Basic visualization
+DimPlot(CAM_int, group.by = c("seurat_clusters", "condition", "batch_effect"), ncol = 3)
+
+# tdTomato check
+FeaturePlot(CAM_int, "tdT", split.by = "condition", pt.size = 0.6)
+
+saveRDS(CAM_int, OUTPUT_CAM_RDS)
+# CAM_int <- readRDS(OUTPUT_CAM_RDS)
+
+# ── 6. Cluster proportion statistics ─────────────────────────────────────────
+cluster_prop_strat <- function(seu) {
+  meta <- seu@meta.data %>%
+    mutate(cluster = as.character(seurat_clusters)) %>%
+    group_by(orig.ident, condition, cluster) %>%
+    summarise(n = n(), .groups = "drop")
+
+  totals <- meta %>%
+    group_by(orig.ident, condition) %>%
+    summarise(total = sum(n), .groups = "drop")
+
+  left_join(meta, totals, by = c("orig.ident", "condition")) %>%
+    mutate(percentage = 100 * n / total)
+}
+
+prop_df <- cluster_prop_strat(CAM_int)
+
+summary_prop <- prop_df %>%
+  group_by(cluster, condition) %>%
+  summarise(
+    mean_perc = mean(percentage),
+    sd_perc   = sd(percentage),
+    .groups   = "drop"
+  )
+
+plot_prop <- left_join(prop_df, summary_prop, by = c("cluster", "condition"))
+
+# Simple bar + jitter + stats
+ggplot(plot_prop, aes(cluster, percentage, fill = condition)) +
+  geom_bar(stat = "summary", fun = "mean", position = position_dodge()) +
+  geom_errorbar(stat = "summary", fun.data = mean_se, position = position_dodge(0.9), width = 0.2) +
+  geom_jitter(aes(color = condition), position = position_jitterdodge()) +
+  stat_compare_means(method = "t.test", label = "p.format") +
+  theme_minimal() +
+  labs(title = "CAM cluster proportions by condition")
+
+# Propeller differential abundance testing
+sce_prop <- as.SingleCellExperiment(CAM_int)
+colData(sce_prop)$sample  <- CAM_int$orig.ident
+colData(sce_prop)$group   <- CAM_int$condition
+colData(sce_prop)$cluster <- CAM_int$seurat_clusters
+
+prop_res <- propeller(
+  sce       = sce_prop,
+  clusters  = sce_prop$cluster,
+  group     = sce_prop$group,
+  sample    = sce_prop$sample,
+  transform = "asin"
+)
+
+write_tsv(prop_res, file.path(TABLES_DIR, "propeller_CAM_clusters.tsv"))
+
+# ── 7. Marker finding & volcano plots ────────────────────────────────────────
+Idents(CAM_int) <- "seurat_clusters"
+markers_all <- FindAllMarkers(CAM_int, only.pos = TRUE, min.pct = 0.1)
+write_tsv(markers_all, file.path(TABLES_DIR, "CAM_cluster_markers.tsv"))
+
+# Condition-level markers
+Idents(CAM_int) <- "condition"
+cond_markers <- FindMarkers(CAM_int, ident.1 = "BLZ", ident.2 = "CTL", min.pct = 0.1)
+write_tsv(cond_markers %>% rownames_to_column("gene"), file.path(TABLES_DIR, "CAM_condition_markers.tsv"))
+
+# Example volcano (adapt for your clusters of interest)
+volcano_basic <- function(markers, title = "") {
+  markers %>%
+    mutate(sig = p_val_adj < 0.05 & abs(avg_log2FC) > 0.59) %>%
+    ggplot(aes(avg_log2FC, -log10(p_val_adj), color = sig)) +
+    geom_point(size = 1.2, alpha = 0.8) +
+    scale_color_manual(values = c("grey70", "#E41A1C")) +
+    geom_vline(xintercept = c(-0.59, 0.59), linetype = "dashed", color = "forestgreen") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "forestgreen") +
+    theme_minimal() +
+    labs(title = title, x = "log2 Fold Change", y = "-log10(adj. p-value)")
+}
+
+# ── 8. Module scores (bulk-derived signatures) ──────────────────────────────
+genes_mhcii <- c(...)   # your long MHCII list
+genes_lyve1 <- c(...)   # your long Lyve1 list
+
+CAM_int <- AddModuleScore(CAM_int, features = list(genes_mhcii), name = "MHCII_score", assay = "integrated")
+CAM_int <- AddModuleScore(CAM_int, features = list(genes_lyve1), name = "Lyve1_score", assay = "integrated")
+
+FeaturePlot(CAM_int, c("MHCII_score1", "Lyve1_score1"), ncol = 2)
+VlnPlot(CAM_int, c("MHCII_score1", "Lyve1_score1"), group.by = "CAM_subtype")
+
+# ── Session info ─────────────────────────────────────────────────────────────
+sessionInfo()
