@@ -1,0 +1,198 @@
+# =============================================================================
+# Project:   CAMs scRNA-seq
+# Author:    Max Fliegauf
+# Date:      2024
+# Purpose:   Standard Seurat workflow + integration + manual curation
+#            starting from QC-filtered object
+# =============================================================================
+
+# ── Libraries ────────────────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(Matrix)
+  library(gridExtra) 
+  # Optional / conditionally used:
+  # library(plotly)
+  # library(tidyheatmaps)
+})
+
+# ── Configuration ────────────────────────────────────────────────────────────
+# Use {here} for robust paths (strongly recommended)
+# install.packages("here") if needed
+library(here)
+
+BASE_DIR     <- here()
+QC_RDS       <- here("results/rds/seurat_after_qc_tdT_WPRE_looseFiltering.rds")
+CURATED_RDS  <- here("results/rds/cso_curated_looseFiltering.rds")
+INTEGRATED_RDS_FINAL <- here("results/rds/cso_integr_looseFilter.rds")
+
+# Analysis parameters
+HVF_NFEATURES     <- 3000      # was 5000 → often 2000-4000 is enough after filtering
+PCA_DIMS          <- 1:25
+UMAP_N_NEIGHBORS  <- 30L       # default
+RESOLUTION        <- 0.9       # initial
+RES_INTEGRATED    <- 1.0
+
+# Genes / patterns to exclude from HVGs
+EXCLUDE_PATTERNS <- c("^mt-", "^Rp[sl][[:digit:]]", "^Rpsa", "tdTomato", "cre", "WPRE-QY")
+
+# ── 1. Load QC object & clean up ─────────────────────────────────────────────
+cso <- readRDS(QC_RDS)
+cso[["Multiplexing"]] <- NULL 
+
+# Quick sanity check
+cat("Initial object:\n")
+print(cso)
+
+# ── 2. Standard preprocessing ────────────────────────────────────────────────
+cso <- NormalizeData(cso)
+cso <- FindVariableFeatures(cso, selection.method = "vst", nfeatures = HVF_NFEATURES)
+
+# Exclude unwanted genes from variable features
+var_features <- VariableFeatures(cso)
+exclude <- grepl(paste(EXCLUDE_PATTERNS, collapse = "|"), rownames(cso))
+VariableFeatures(cso) <- var_features[!var_features %in% rownames(cso)[exclude]]
+
+# Scale & dimensionality reduction
+cso <- ScaleData(cso, features = VariableFeatures(cso))
+cso <- RunPCA(cso, features = VariableFeatures(cso))
+
+# Quick diagnostics
+ElbowPlot(cso, ndims = 40)
+# DimHeatmap(cso, dims = 1:15, balanced = TRUE, cells = 500)
+
+# ── 3. Initial clustering & visualization ────────────────────────────────────
+cso <- RunUMAP(cso, dims = PCA_DIMS, n.neighbors = UMAP_N_NEIGHBORS)
+cso <- FindNeighbors(cso, dims = PCA_DIMS)
+cso <- FindClusters(cso, resolution = RESOLUTION)
+
+# Basic plots
+p1 <- DimPlot(cso, label = TRUE, repel = TRUE) + ggtitle("Clusters")
+p2 <- DimPlot(cso, group.by = "condition") + ggtitle("Condition")
+p3 <- FeaturePlot(cso, features = c("percent.mt", "percent.ribo", "nFeature_RNA"), ncol = 3)
+(p1 | p2) / p3
+
+# ── 4. Preliminary cell type annotation ─────────────────────────────────────
+# You can also load this from a separate marker table / csv later
+cso <- cso |> 
+  mutate_meta(
+    cell_type = case_when(
+      seurat_clusters %in% c(0,3,5,6,7,11,13)  ~ "MG",
+      seurat_clusters %in% c(1,2,4,9,10)       ~ "CAM",
+      seurat_clusters %in% c(8,12)             ~ "Mono",
+      TRUE                                     ~ "Unknown"
+    )
+  )
+
+DimPlot(cso, group.by = "cell_type", label = TRUE, repel = TRUE)
+
+# ── 5. Manual doublet removal using CellSelector ─────────────────────────────
+# ── This part must be run interactively ──────────────────────────────────────
+
+# CAM doublets
+plot_cam <- DimPlot(cso, cells = WhichCells(cso, idents = "CAM"))
+cso <- CellSelector(plot_cam, object = cso, ident = "doublets_CAM")
+
+# MG doublets
+plot_mg <- DimPlot(cso, cells = WhichCells(cso, idents = "MG"))
+cso <- CellSelector(plot_mg, object = cso, ident = "doublets_MG")
+
+# Mono doublets
+plot_mono <- DimPlot(cso, cells = WhichCells(cso, idents = "Mono"))
+cso <- CellSelector(plot_mono, object = cso, ident = "doublets_Mono")
+
+# Mark & remove
+cso$multiplet <- ifelse(
+  Idents(cso) %in% c("doublets_CAM", "doublets_MG", "doublets_Mono"),
+  "doublet", "singlet"
+)
+
+DimPlot(cso, group.by = "multiplet")
+
+cso <- subset(cso, subset = multiplet == "singlet")
+
+saveRDS(cso, CURATED_RDS)
+# cso <- readRDS(CURATED_RDS)   # reload point
+
+# ── 6. Batch definition & crude integration (CCA) ────────────────────────────
+cso$batch_effect <- case_when(
+  orig.ident %in% c("BLZ_F_1","BLZ_F_2","BLZ_M_1","BLZ_M_2") ~ "BLZ",
+  orig.ident %in% c("CTL_F_1","CTL_F_2","CTL_M_1","CTL_M_2") ~ "CTL",
+  TRUE ~ "other"
+) |> factor()
+
+DimPlot(cso, group.by = "batch_effect")
+
+# Split → CCA integration
+obj_list <- SplitObject(cso, split.by = "batch_effect")
+
+anchors <- FindIntegrationAnchors(
+  object.list = obj_list,
+  reduction   = "cca",
+  dims        = PCA_DIMS
+)
+
+integrated <- IntegrateData(anchorset = anchors, dims = PCA_DIMS)
+
+# Transfer integrated assay back
+cso_int <- cso
+cso_int[["integrated"]] <- integrated[["integrated"]]
+DefaultAssay(cso_int) <- "integrated"
+
+# Re-run dimred & clustering on integrated space
+cso_int <- ScaleData(cso_int)
+cso_int <- RunPCA(cso_int)
+cso_int <- RunUMAP(cso_int, dims = PCA_DIMS)
+cso_int <- FindNeighbors(cso_int, dims = PCA_DIMS)
+cso_int <- FindClusters(cso_int, resolution = RES_INTEGRATED)
+
+DimPlot(cso_int, group.by = c("batch_effect", "seurat_clusters"), ncol = 2)
+
+# ── 7. Final filtering & re-annotation loop ──────────────────────────────────
+
+# Remove obvious batch clusters if needed
+cso_int <- subset(cso_int, subset = cell_type != "batch" & !is.na(cell_type))
+
+# Re-run HVF / scaling / PCA / UMAP / clustering after removal
+cso_int <- FindVariableFeatures(cso_int, nfeatures = 2000)
+var_features <- VariableFeatures(cso_int)
+exclude <- grepl(paste(EXCLUDE_PATTERNS, collapse = "|"), rownames(cso_int))
+VariableFeatures(cso_int) <- var_features[!var_features %in% rownames(cso_int)[exclude]]
+
+cso_int <- ScaleData(cso_int)
+cso_int <- RunPCA(cso_int)
+cso_int <- RunUMAP(cso_int, dims = PCA_DIMS)
+cso_int <- FindNeighbors(cso_int, dims = PCA_DIMS)
+cso_int <- FindClusters(cso_int, resolution = 1.0)
+
+# Final manual annotation (update as needed)
+cso_int <- cso_int |> 
+  mutate_meta(
+    cell_type = case_when(
+      seurat_clusters %in% c(0,1,3,5,9)     ~ "MG",
+      seurat_clusters %in% c(2,4,7,8,11,13) ~ "CAM",
+      seurat_clusters %in% c(10)            ~ "ncMono",
+      seurat_clusters %in% c(15)            ~ "clMono",
+      seurat_clusters %in% c(14,17)         ~ "activMG",
+      seurat_clusters %in% c(16)            ~ "cDC2",
+      seurat_clusters %in% c(18)            ~ "migDC",
+      seurat_clusters %in% c(19,20)         ~ "Neutrophil",
+      TRUE                                  ~ "Other/Unknown"
+    )
+  )
+
+DimPlot(cso_int, group.by = "cell_type", label = TRUE, repel = TRUE)
+
+# tdTomato check
+FeaturePlot(cso_int, "tdT", split.by = "condition", pt.size = 0.6)
+
+# ── 8. Save final object ─────────────────────────────────────────────────────
+saveRDS(cso_int, INTEGRATED_RDS_FINAL)
+
+cat("Final integrated & annotated object saved to:\n", INTEGRATED_RDS_FINAL, "\n")
+
+sessionInfo()
