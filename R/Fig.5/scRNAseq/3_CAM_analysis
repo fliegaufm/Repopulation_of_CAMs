@@ -24,7 +24,6 @@ suppressPackageStartupMessages({
 })
 
 # ── Paths & Parameters ───────────────────────────────────────────────────────
-here::i_am("analysis/04_CAMs_only_analysis.R")   # recommended
 
 INPUT_RDS     <- here("results/rds/cso_integr.rds")
 OUTPUT_CAM_RDS <- here("results/rds/CAMs_integrated.rds")
@@ -187,7 +186,26 @@ volcano_basic <- function(markers, title = "") {
     labs(title = title, x = "log2 Fold Change", y = "-log10(adj. p-value)")
 }
 
-# ── 8. Module scores (bulk-derived signatures) ──────────────────────────────
+
+# ── 8. Volcano: Cluster 1 + 3 vs Cluster 2 ──────────────────
+# (adapt cluster numbers if your final numbering changed after re-clustering)
+
+Idents(CAM_int) <- "seurat_clusters"
+
+# Compare cluster 1 and 3 (combined) vs cluster 2
+de_13_vs_2 <- FindMarkers(
+  CAM_int,
+  ident.1   = c("1", "3"), 
+  ident.2   = "2",
+  min.pct   = 0.2
+)
+
+# Replace exact 0 p-values (common in very large datasets)
+de_13_vs_2$p_val_adj[de_13_vs_2$p_val_adj == 0] <- .Machine$double.xmin
+
+#Procede with Volcano plotting
+
+# ── 9. Module scores (bulk-derived signatures) ──────────────────────────────
 genes_mhcii <- c(...)   # your long MHCII list
 genes_lyve1 <- c(...)   # your long Lyve1 list
 
