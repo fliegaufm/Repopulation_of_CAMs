@@ -1,0 +1,354 @@
+# =============================================================================
+# Project:   Revision Niche scRNA-seq – Merge & Comprehensive Annotation Workflow
+# Script:    00_merge_two_experiments_and_annotation.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Merge two Seurat objects (exp1 + exp2), harmonize metadata,
+#            perform standard workflow, transfer annotations from exp1 to exp2,
+#            sub-cluster immune / fibroblast / pericyte populations,
+#            iteratively remove doublets/trash, apply final broad & fine annotations,
+#            run Harmony integration, and produce final annotated object.
+#
+# Important notes:
+#   - All manual annotation decisions are preserved and clearly documented.
+#   - Interactive CellSelector steps are marked — run once, then save object.
+#   - Subclustering (immune, fibro, PC) is kept in one file for traceability,
+#     but can be split later if desired.
+#   - Annotation is defined by subclustering similar cell types and annotating 
+#     them by markers for subtypes from relevant literature
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(SingleCellExperiment)
+  library(presto)
+  # library(EnhancedVolcano)
+  # library(CellChat)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+
+# Input files (pre-QC objects from each experiment)
+RDS_EXP1 <- here("data/raw/cso_final_waiting.rds")
+RDS_EXP2 <- here("data/raw/cso_after_qc_second_experiment.rds")
+
+# Output files
+OUT_MERGED     <- here("results/rds/merged_annotated_run1_and2.rds")
+OUT_FINAL_INT  <- here("results/rds/full_dataset_final_after_integration.rds")
+OUT_FINAL_ANNO <- here("results/rds/full_dataset_final_after_integration_and_final_annotation.rds")
+
+TABLES_DIR <- here("results/tables")
+FIGURES_DIR <- here("results/figures")
+
+dir.create(TABLES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load & harmonize metadata ─────────────────────────────────────────────
+cso1 <- readRDS(RDS_EXP1)
+cso2 <- readRDS(RDS_EXP2)
+
+# Standardize condition/timepoint/sex/mouse columns
+cso1 <- cso1 %>%
+  mutate_meta(
+    timepoint = sub("_.*", "", condition),
+    sex       = sub(".*_(F|M).*", "\\1", condition),
+    mouse     = sub(".*_(F|M)", "", condition),
+    run       = "1"
+  )
+
+cso2 <- cso2 %>%
+  mutate_meta(
+    timepoint = sub("_.*", "", Condition),
+    sex       = sub(".*_(F|M).*", "\\1", Condition),
+    mouse     = sub(".*_(F|M)", "", Condition),
+    tissue    = recode(tissue, LM = "Lm", Ctx = "Ctx", .default = "Unknown"),
+    run       = "2"
+  )
+
+# Rename columns for consistency
+colnames(cso2@meta.data)[colnames(cso2@meta.data) == "scDblFinder_score"] <- "scDblFinder.score"
+colnames(cso2@meta.data)[colnames(cso2@meta.data) == "scDblFinder_class"] <- "scDblFinder.class"
+colnames(cso2@meta.data)[colnames(cso2@meta.data) == "Condition"]         <- "condition"
+
+DimPlot(cso1, group.by = "tissue") + ggtitle("Exp 1 – Tissue distribution")
+DimPlot(cso2, group.by = "tissue") + ggtitle("Exp 2 – Tissue distribution")
+
+# ── 2. Merge the two experiments ─────────────────────────────────────────────
+merged <- merge(cso1, cso2, add.cell.ids = c("cso1", "cso2"))
+
+# Safety: add run tag from prefixes
+merged$run <- ifelse(grepl("^cso1_", colnames(merged)), "1", "2")
+
+# ── 3. Standard Seurat workflow on merged object ─────────────────────────────
+merged <- FindVariableFeatures(merged)
+merged <- ScaleData(merged)
+merged <- RunPCA(merged)
+ElbowPlot(merged, ndims = 40)
+
+merged <- RunUMAP(merged, dims = 1:20)
+merged <- FindNeighbors(merged, dims = 1:20)
+cso_final <- FindClusters(merged, resolution = 1.0)
+
+# Diagnostic plots
+DimPlot(cso_final, group.by = c("run", "tissue", "timepoint", "annotation"), ncol = 2)
+DimPlot(cso_final, group.by = "seurat_clusters", label = TRUE, repel = TRUE)
+
+saveRDS(cso_final, OUT_MERGED)
+
+# ── 4. Transfer annotations from Exp 1 to Exp 2 (majority vote per cluster) ───
+# Annotation transfer
+anno_map <- cso_final@meta.data %>%
+  filter(run == "1" & !is.na(annotation)) %>%
+  group_by(seurat_clusters) %>%
+  summarise(annotation = names(sort(table(annotation), decreasing = TRUE))[1], .groups = "drop")
+
+cso_final$annotation[cso_final$run == "2"] <-
+  anno_map$annotation[match(cso_final$seurat_clusters[cso_final$run == "2"], anno_map$seurat_clusters)]
+
+# cell_subtype transfer (same logic)
+subtype_map <- cso_final@meta.data %>%
+  filter(run == "1" & !is.na(cell_subtype)) %>%
+  group_by(seurat_clusters) %>%
+  summarise(cell_subtype = names(sort(table(cell_subtype), decreasing = TRUE))[1], .groups = "drop")
+
+cso_final$cell_subtype[cso_final$run == "2"] <-
+  subtype_map$cell_subtype[match(cso_final$seurat_clusters[cso_final$run == "2"], subtype_map$seurat_clusters)]
+
+DimPlot(cso_final, group.by = "annotation", label = TRUE, repel = TRUE) + ggtitle("Transferred annotation")
+DimPlot(cso_final, group.by = "cell_subtype", label = TRUE, repel = TRUE) + ggtitle("Transferred cell subtype")
+
+# ── 5. Cell cycle scoring ────────────────────────────────────────────────────
+cso_final <- CellCycleScoring(
+  cso_final,
+  s.features   = cc.genes.updated.2019$s.genes,
+  g2m.features = cc.genes.updated.2019$g2m.genes
+)
+
+DimPlot(cso_final, group.by = c("Phase", "cell_subtype"))
+
+# ── 6. Sub-clustering: Immune cells ──────────────────────────────────────────
+immune <- subset(cso_final, annotation == "Immune")
+
+immune <- FindVariableFeatures(immune, nfeatures = 2000)
+immune <- ScaleData(immune)
+immune <- RunPCA(immune)
+ElbowPlot(immune, ndims = 30)
+
+immune <- RunUMAP(immune, dims = 1:20)
+immune <- FindNeighbors(immune, dims = 1:20)
+immune_clustered <- FindClusters(immune, resolution = 0.6)
+
+DimPlot(immune_clustered, group.by = c("tissue", "timepoint", "seurat_clusters", "cell_subtype"))
+
+immune_markers <- FindAllMarkers(immune_clustered, only.pos = TRUE, min.pct = 0.2)
+immune_markers <- filter(immune_markers, p_val_adj < 0.05 & avg_log2FC > 0.5)
+write_tsv(immune_markers, file.path(TABLES_DIR, "immune_subcluster_markers.tsv"))
+
+# Apply your original manual annotation for immune subtypes
+immune_clustered <- immune_clustered %>%
+  mutate_meta(
+    cell_subtype = case_when(
+      seurat_clusters %in% c(0, 2, 14)  ~ "Microglia",
+      seurat_clusters %in% c(1, 3, 5, 13)~ "Macrophages",
+      seurat_clusters %in% "4"        ~ "repopulating_Microglia",
+      seurat_clusters %in% "6"        ~ "dividing_cells",
+      seurat_clusters %in% "7"        ~ "clMono",
+      seurat_clusters %in% "12"       ~ "ncMono",
+      seurat_clusters %in% "8"        ~ "trash",
+      seurat_clusters %in% "9"        ~ "cDC2",
+      seurat_clusters %in% "10"       ~ "T_cells",
+      seurat_clusters %in% "11"       ~ "Neutrophils",
+      seurat_clusters %in% "15"       ~ "NKC",
+      seurat_clusters %in% "16"       ~ "pDC/APC",
+      seurat_clusters %in% "17"       ~ "Osteoclast-like_Macrophages",
+      seurat_clusters %in% "18"       ~ "B_cells",
+      seurat_clusters %in% "19"       ~ "Mast_cells",
+      TRUE                            ~ cell_subtype  # preserve existing
+    )
+  )
+
+# Transfer back to main object
+cso_final$cell_subtype[match(rownames(immune_clustered@meta.data), rownames(cso_final@meta.data))] <-
+  immune_clustered$cell_subtype
+
+# ── 7. Sub-clustering: Fibroblasts ───────────────────────────────────────────
+fibros <- subset(cso_final, annotation == "Fibro")
+
+fibros <- FindVariableFeatures(fibros, nfeatures = 2000)
+fibros <- ScaleData(fibros)
+fibros <- RunPCA(fibros)
+ElbowPlot(fibros, ndims = 30)
+
+fibros <- RunUMAP(fibros, dims = 1:20)
+fibros <- FindNeighbors(fibros, dims = 1:20)
+fibros_clustered <- FindClusters(fibros, resolution = 1.0)
+
+DimPlot(fibros_clustered, group.by = c("tissue", "timepoint", "seurat_clusters"))
+
+fibro_markers <- FindAllMarkers(fibros_clustered, only.pos = TRUE, min.pct = 0.2)
+fibro_markers <- filter(fibro_markers, p_val_adj < 0.05 & avg_log2FC > 0.5)
+write_tsv(fibro_markers, file.path(TABLES_DIR, "fibro_subcluster_markers.tsv"))
+
+# Apply your original fibro subtype annotation
+fibros_clustered <- fibros_clustered %>%
+  mutate_meta(
+    cell_subtype = case_when(
+      seurat_clusters %in% "0"  ~ "duFB2",
+      seurat_clusters %in% "1"  ~ "FB1",
+      seurat_clusters %in% c(2,5,6,14) ~ "duFB1",
+      seurat_clusters %in% "3"  ~ "duFB3",
+      seurat_clusters %in% "4"  ~ "pvFB",
+      seurat_clusters %in% c(7,10) ~ "immuneFB",
+      seurat_clusters %in% "8"  ~ "lmFB",
+      seurat_clusters %in% "9"  ~ "duFB4",
+      seurat_clusters %in% "11" ~ "duFB5",
+      seurat_clusters %in% "12" ~ "trash",
+      seurat_clusters %in% "13" ~ "duFB6",
+      seurat_clusters %in% c(15,16,17) ~ "trash",
+      TRUE                      ~ cell_subtype
+    )
+  )
+
+# Transfer back
+cso_final$cell_subtype[match(rownames(fibros_clustered@meta.data), rownames(cso_final@meta.data))] <-
+  fibros_clustered$cell_subtype
+
+# ── 8. Sub-clustering: Pericytes / VSMC ──────────────────────────────────────
+pcs <- subset(cso_final, annotation %in% c("PC", "SMC"))
+
+pcs <- FindVariableFeatures(pcs, nfeatures = 2000)
+pcs <- ScaleData(pcs)
+pcs <- RunPCA(pcs)
+ElbowPlot(pcs, ndims = 30)
+
+pcs <- RunUMAP(pcs, dims = 1:15)
+pcs <- FindNeighbors(pcs, dims = 1:15)
+pcs_clustered <- FindClusters(pcs, resolution = 0.8)
+
+DimPlot(pcs_clustered, group.by = c("tissue", "timepoint", "seurat_clusters"))
+
+pc_markers <- FindAllMarkers(pcs_clustered, only.pos = TRUE, min.pct = 0.2)
+pc_markers <- filter(pc_markers, p_val_adj < 0.05 & avg_log2FC > 0.5)
+write_tsv(pc_markers, file.path(TABLES_DIR, "pc_vsmc_markers.tsv"))
+
+# Apply your original PC/VSMC subtype annotation
+pcs_clustered <- pcs_clustered %>%
+  mutate_meta(
+    cell_subtype = case_when(
+      seurat_clusters %in% "0"  ~ "ret_pvFB2",
+      seurat_clusters %in% "1"  ~ "cap_venPC",
+      seurat_clusters %in% "2"  ~ "capPC",
+      seurat_clusters %in% "3"  ~ "venPC1",
+      seurat_clusters %in% "4"  ~ "act_venPC",
+      seurat_clusters %in% "5"  ~ "venPC2",
+      seurat_clusters %in% "6"  ~ "duFB7",
+      seurat_clusters %in% "7"  ~ "FB/SMC",
+      seurat_clusters %in% c(8,10,13) ~ "trash",
+      seurat_clusters %in% "9"  ~ "contractVSMC",
+      seurat_clusters %in% "11" ~ "signVSMC",
+      seurat_clusters %in% "12" ~ "reactivSMC",
+      TRUE                      ~ cell_subtype
+    )
+  )
+
+# Transfer back
+cso_final$cell_subtype[match(rownames(pcs_clustered@meta.data), rownames(cso_final@meta.data))] <-
+  pcs_clustered$cell_subtype
+
+# ── 9. Iterative manual doublet/trash removal ─────────────────────────────────
+# Repeat as many times as needed (each iteration visualizes → selects → inspects markers → decides)
+# Cells with more than one cell type specific marker should be removed
+
+# Example iteration 1
+p <- DimPlot(cso_final, group.by = "cell_subtype", label = TRUE, repel = TRUE) +
+  ggtitle("Select potential doublets/trash – Iteration 1")
+selected <- CellSelector(plot = p)
+
+if (length(selected) > 0) {
+  cat("Selected", length(selected), "cells for inspection\n")
+  
+  # Temporary identity to run differential expression
+  cso_final$temp_ident <- ifelse(colnames(cso_final) %in% selected, "sel", "other")
+  Idents(cso_final) <- "temp_ident"
+  
+  markers_sel <- FindMarkers(cso_final, ident.1 = "sel", min.pct = 0.25, logfc.threshold = 0.25)
+  cat("Top 200 markers of selected cells:\n")
+  print(head(markers_sel, 200))
+  
+  # ── MANUAL DECISION POINT ────────────────────────────────────────────────
+  # Review markers:
+  #   - Doublets → mixed lineage markers (e.g. Ttr + Cldn5, Pdgfrb + Slc1a3)
+  #   - Low quality → high mt- genes, low nFeature_RNA
+  # Decide: trash / doublets / specific subtype?
+  
+  # Example: assign selected cells to a subtype (uncomment & adapt)
+  # cso_final$cell_subtype[colnames(cso_final) %in% selected] <- "duFB1"
+  
+  # Or mark as trash/doublets (uncomment when sure)
+  # cso_final$cell_subtype[colnames(cso_final) %in% selected] <- "doublets"
+  
+  cso_final$temp_ident <- NULL
+} else {
+  cat("No cells selected in this iteration.\n")
+}
+
+# After all iterations, remove final trash/doublets
+cso_final <- subset(cso_final, subset = cell_subtype %notin% c("doublets", "trash"))
+
+DimPlot(cso_final, group.by = "cell_subtype", label = TRUE, repel = TRUE) +
+  ggtitle("After doublet/trash removal")
+
+# ── 10. Final broad annotation & corrections ─────────────────────────────────
+cso_final <- cso_final %>%
+  mutate_meta(
+    annotation = case_when(
+      cell_subtype %in% c("Astros")                     ~ "Astro",
+      cell_subtype %in% c("actEC", "artEC1", "artEC2", "EC1", "EC2", "EC3", "EC4", "EC5", "iegEC", "vEC1") ~ "Endothelial",
+      cell_subtype %in% "Erythrocytes"                  ~ "Erythrocytes",
+      cell_subtype %in% c("FB1", "duFB1", "duFB2", "duFB3", "duFB4", "duFB5", "duFB6", "duFB7", "immuneFB", "pvFB", "lmFB", "ret_pvFB2") ~ "Fibro",
+      cell_subtype %in% c("dividing_cells", "B_cells", "cDC2", "clMono", "Macrophages", "Mast_cells", "Microglia", "ncMono", "Neutrophils", "NKC", "Osteoclast-like_Macrophages", "pDC/APC", "repopulating_Microglia", "T_cells") ~ "Immune",
+      cell_subtype %in% c("Oligos", "OPC")              ~ "Oligo/OPC",
+      cell_subtype %in% c("act_venPC", "cap_venPC", "capPC", "venPC1", "venPC2") ~ "Pericyte",
+      cell_subtype %in% c("contractVSMC", "FB/SMC", "reactivSMC", "signVSMC") ~ "SMC",
+      TRUE                                              ~ annotation
+    )
+  )
+
+# Small fixes
+cso_final$cell_subtype[cso_final$cell_subtype == "Erythroctes"] <- "Erythrocytes"
+cso_final$cell_subtype[cso_final$cell_subtype %in% c("B_cells")] <- "B_cell"
+cso_final$cell_subtype[cso_final$cell_subtype %in% c("Mast_cells")] <- "Mast_cell"
+
+DimPlot(cso_final, group.by = "annotation", label = TRUE, repel = TRUE)
+
+# ── 11. Final Harmony integration & clustering ───────────────────────────────
+cso_final[["RNA"]] <- split(cso_final[["RNA"]], f = cso_final$run)
+
+cso_harmony <- IntegrateLayers(
+  cso_final,
+  method          = HarmonyIntegration,
+  orig.reduction  = "pca",
+  new.reduction   = "harmony"
+)
+
+cso_harmony <- RunUMAP(cso_harmony, reduction = "harmony", dims = 1:30)
+cso_harmony <- FindNeighbors(cso_harmony, dims = 1:30)
+cso_harmony <- FindClusters(cso_harmony, resolution = 0.6)
+
+DimPlot(cso_harmony, group.by = c("run", "timepoint", "tissue", "cell_subtype"))
+
+# Final subtype corrections
+cso_harmony <- cso_harmony %>%
+  mutate_meta(
+    cell_subtype = case_when(
+      cell_subtype %in% c("homMicroglia1", "homMicroglia2", "homMicroglia3") ~ "homMicroglia",
+      cell_subtype %in% c("divdingMacrophages", "dividing_cells")           ~ "proliferating",
+      TRUE                                                                  ~ cell_subtype
+    )
+  )
+
+saveRDS(cso_harmony, OUT_FINAL_ANNO)
