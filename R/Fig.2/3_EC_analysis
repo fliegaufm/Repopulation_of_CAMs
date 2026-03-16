@@ -1,0 +1,228 @@
+# =============================================================================
+# Project:   Revision Niche scRNA-seq – Endothelial Cell (EC) Sub-analysis
+# Script:    03_EC_subclustering_and_analysis.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Subset endothelial cells from full integrated object → re-cluster →
+#            find markers → manual subtype annotation → differential expression
+#            across timepoints (d5 vs CTL, 8w vs d5, 8w vs CTL) in Ctx/Lm and Dura →
+#            volcano plots
+#
+#   - Propeller testing
+#   - Tissue-stratified DE (Ctx/Lm vs Dura)
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(enrichplot)
+  library(EnhancedVolcano)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+
+INPUT_RDS <- here("results/rds/full_dataset_final_after_integration_and_final_annotation.rds")
+
+TABLES_DIR  <- here("results/tables/EC")
+FIGURES_DIR <- here("results/figures/EC")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load full object & subset ECs (only run 1) ────────────────────────────
+full <- readRDS(INPUT_RDS)
+
+ecs <- subset(full, annotation == "Endothelial" & run == "1")
+
+cat("EC subset contains", ncol(ecs), "cells from run 1\n")
+
+# ── 2. Re-processing & subclustering ─────────────────────────────────────────
+ecs <- FindVariableFeatures(ecs, selection.method = "vst", nfeatures = 2000)
+ecs <- ScaleData(ecs)
+ecs <- RunPCA(ecs)
+ElbowPlot(ecs, ndims = 30)
+
+ecs <- RunUMAP(ecs, dims = 1:15)
+ecs <- FindNeighbors(ecs, dims = 1:15)
+ecs_clustered <- FindClusters(ecs, resolution = 0.3)
+
+# Diagnostic plots
+DimPlot(ecs_clustered, group.by = c("tissue", "timepoint", "seurat_clusters", "cell_subtype_final"))
+
+# ── 3. Find cluster markers & manual subtype annotation ──────────────────────
+Idents(ecs_clustered) <- "seurat_clusters"
+
+ec_markers <- FindAllMarkers(
+  ecs_clustered,
+  only.pos       = TRUE,
+  min.pct        = 0.1,
+  logfc.threshold = 0.4
+)
+
+ec_markers_sub <- ec_markers %>%
+  filter(p_val_adj < 0.01) %>%
+  group_by(cluster) %>%
+  slice_head(n = 30) %>%
+  ungroup()
+
+write_tsv(ec_markers_sub, file.path(TABLES_DIR, "EC_subcluster_markers_top30.tsv"))
+
+# Apply EC subtype annotation based on Vanlandewijk and others
+ecs_clustered <- ecs_clustered %>%
+  mutate_meta(
+    cell_subtype = case_when(
+      seurat_clusters %in% "0" ~ "capillaryEC",
+      seurat_clusters %in% "1" ~ "arteriolarEC",
+      seurat_clusters %in% "2" ~ "activatedEC",
+      seurat_clusters %in% "3" ~ "fenestratedECs",
+      seurat_clusters %in% "4" ~ "duralEC",
+      seurat_clusters %in% "5" ~ "venousECs",
+      seurat_clusters %in% "6" ~ "lymphatic-likeECs",
+      seurat_clusters %in% "7" ~ "arterialEC",
+      seurat_clusters %in% "8" ~ "venous_capillaryEC",
+      TRUE                     ~ cell_subtype_final  # preserve original if not matched
+    )
+  )
+
+DimPlot(ecs_clustered, group.by = "cell_subtype", label = TRUE, repel = TRUE) +
+  ggtitle("EC subtypes after subclustering")
+
+
+# ── 4. Propeller Testing ────────────────────────────────────────────
+
+# Set seed for reproducibility
+  set.seed(123)
+      
+cell_info_base <- data.frame(
+    barcode  = rownames(ecs_clustered@meta.data),
+    clusters = ecs_clustered@meta.data$cell_subtype_final,
+    samples  = ecs_clustered@meta.data$sample,
+    group    = ecs_clustered@meta.data$timepoint,
+    stringsAsFactors = FALSE
+)
+      
+# Keep only non-NA clusters
+cell_info_base <- cell_info_base %>% filter(!is.na(clusters))
+cell_info_base <- cell_info_base %>% mutate(group = factor(group, levels = c("CTL", "d5", "8w")))
+      
+prop_results_ecs <- propeller(
+  clusters = cell_info_base$clusters,
+  sample   = cell_info_base$samples,
+  group    = cell_info_base$group
+)
+      
+cat("\nPropeller results for Run 1:\n")
+print(prop_results_ecs)
+      
+prop_results_ecs$Run <- "Run1"
+
+# write.table with propeller results
+      
+
+# ── 5. Tissue-stratified differential expression ─────────────────────────────
+ecs_ctx_lm <- subset(ecs_clustered, tissue %in% c("Ctx", "Lm"))
+ecs_dura   <- subset(ecs_clustered, tissue == "Dura")
+
+Idents(ecs_ctx_lm) <- "timepoint"
+ecs_ctx_lm <- JoinLayers(ecs_ctx_lm)
+
+Idents(ecs_dura) <- "timepoint"
+ecs_dura <- JoinLayers(ecs_dura)
+
+# Comparisons
+comparisons <- list(
+  list(name = "d5_vs_CTL",   ident1 = "d5",  ident2 = "CTL"),
+  list(name = "8w_vs_d5",    ident1 = "8w",  ident2 = "d5"),
+  list(name = "8w_vs_CTL",   ident1 = "8w",  ident2 = "CTL")
+)
+
+de_results <- list()
+
+for (comp in comparisons) {
+  # Ctx/Lm
+  de_ctx_lm <- FindMarkers(
+    ecs_ctx_lm,
+    ident.1 = comp$ident1,
+    ident.2 = comp$ident2,
+    logfc.threshold = 0,
+    min.pct = 0.01,
+    test.use = "wilcox",
+    only.pos = FALSE
+  )
+  de_ctx_lm$gene <- rownames(de_ctx_lm)
+  de_results[[paste0("ctx_lm_", comp$name)]] <- de_ctx_lm
+  
+  # Dura
+  de_dura <- FindMarkers(
+    ecs_dura,
+    ident.1 = comp$ident1,
+    ident.2 = comp$ident2,
+    logfc.threshold = 0,
+    min.pct = 0.01,
+    test.use = "wilcox",
+    only.pos = FALSE
+  )
+  de_dura$gene <- rownames(de_dura)
+  de_results[[paste0("dura_", comp$name)]] <- de_dura
+}
+
+# Save all DE results
+iwalk(de_results, ~ write_tsv(.x, file.path(TABLES_DIR, paste0("DE_", .y, ".tsv"))))
+
+# ── 6. Volcano plots ─────────────────────────────────────────────────────────
+pdf(file.path(FIGURES_DIR, "ECs_volcano_plots.pdf"), width = 7, height = 6)
+
+EnhancedVolcano(
+  de_results$ctx_lm_d5_vs_CTL,
+  lab = de_results$ctx_lm_d5_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm: d5 vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results$ctx_lm_8w_vs_d5,
+  lab = de_results$ctx_lm_8w_vs_d5$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm: 8w vs d5",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results$ctx_lm_8w_vs_CTL,
+  lab = de_results$ctx_lm_8w_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm: 8w vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results$dura_d5_vs_CTL,
+  lab = de_results$dura_d5_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura: d5 vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results$dura_8w_vs_d5,
+  lab = de_results$dura_8w_vs_d5$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura: 8w vs d5",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results$dura_8w_vs_CTL,
+  lab = de_results$dura_8w_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura: 8w vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+dev.off()
+sessionInfo()
