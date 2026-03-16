@@ -1,0 +1,401 @@
+# =============================================================================
+# Project:   Revision Niche scRNA-seq – Immune Cell Subtype Analysis
+# Script:    05_immune_subclustering_and_analysis.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Subset immune cells from full integrated object → re-cluster →
+#            Harmony integration across runs → marker finding → manual subtype 
+#            annotation → propeller DA testing (split by run) → 
+#            tissue-stratified DE/volcano plots → Nestin expression visualization.
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(Polychrome)        # createPalette
+  library(speckle)           # propeller
+  library(SingleCellExperiment)
+  library(EnhancedVolcano)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+
+INPUT_RDS <- here("results/rds/full_dataset_final_after_integration_and_final_annotation.rds")
+
+TABLES_DIR  <- here("results/tables/immune")
+FIGURES_DIR <- here("results/figures/immune")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load & subset immune cells ────────────────────────────────────────────
+full <- readRDS(INPUT_RDS)
+
+immune <- subset(full, annotation == "Immune")
+
+cat("Immune subset contains", ncol(immune), "cells\n")
+
+# ── 2. Initial subclustering ─────────────────────────────────────────────────
+immune <- FindVariableFeatures(immune, selection.method = "vst", nfeatures = 2000)
+immune <- ScaleData(immune)
+immune <- RunPCA(immune)
+ElbowPlot(immune, ndims = 30)
+
+immune <- RunUMAP(immune, dims = 1:20)
+immune <- FindNeighbors(immune, dims = 1:20)
+immune_clustered <- FindClusters(immune, resolution = 1.1)
+
+# Diagnostic UMAPs
+DimPlot(immune_clustered, group.by = c("tissue", "timepoint", "seurat_clusters", "cell_subtype_final"))
+
+# ── 3. Harmony integration across runs ───────────────────────────────────────
+immune_split <- immune_clustered
+immune_split[["RNA"]] <- split(immune_split[["RNA"]], f = immune_split$run)
+
+immune_integrated <- IntegrateLayers(
+  immune_split,
+  method          = HarmonyIntegration,
+  orig.reduction  = "pca",
+  new.reduction   = "harmony"
+)
+
+immune_integrated <- RunUMAP(immune_integrated, reduction = "harmony", dims = 1:25)
+immune_integrated <- FindNeighbors(immune_integrated, dims = 1:25)
+immune_integrated <- FindClusters(immune_integrated, resolution = 0.6)
+
+DimPlot(immune_integrated, group.by = c("run", "tissue", "timepoint", "seurat_clusters", "cell_subtype_final"))
+
+# ── 4. Post-integration markers & manual subtype annotation ───────────────────
+immune_integrated <- JoinLayers(immune_integrated)
+
+Idents(immune_integrated) <- "seurat_clusters"
+
+immune_markers <- FindAllMarkers(
+  immune_integrated,
+  only.pos       = TRUE,
+  min.pct        = 0.25,
+  logfc.threshold = 0.5
+)
+
+immune_markers_sub <- immune_markers %>%
+  filter(p_val_adj < 0.01) %>%
+  group_by(cluster) %>%
+  slice_head(n = 50) %>%
+  ungroup()
+
+write_tsv(immune_markers_sub, file.path(TABLES_DIR, "immune_post_integration_markers_top50.tsv"))
+
+# Apply your manual immune subtype annotation
+immune_integrated <- immune_integrated %>%
+  mutate_meta(
+    cell_subtype = case_when(
+      seurat_clusters %in% "0"  ~ "duralCAM",
+      seurat_clusters %in% "1"  ~ "homMicroglia1",
+      seurat_clusters %in% "2"  ~ "repopulatingMicroglia2",
+      seurat_clusters %in% "3"  ~ "repopulatingCAM",
+      seurat_clusters %in% "4"  ~ "homMicroglia2",
+      seurat_clusters %in% "5"  ~ "MHCII_CAM",
+      seurat_clusters %in% "6"  ~ "ncMonocyte",
+      seurat_clusters %in% "7"  ~ "NKT",
+      seurat_clusters %in% "8"  ~ "dividing_cells",
+      seurat_clusters %in% "9"  ~ "repopulatingMicroglia1",
+      seurat_clusters %in% "10" ~ "Lyve1_CAM",
+      seurat_clusters %in% "11" ~ "dividingMacrophages",
+      seurat_clusters %in% "12" ~ "Neutrophil",
+      seurat_clusters %in% "13" ~ "clMonocyte",
+      seurat_clusters %in% "14" ~ "homMicroglia3",
+      seurat_clusters %in% "15" ~ "cDC2",
+      seurat_clusters %in% "16" ~ "Osteoclast-like_Macrophage",
+      seurat_clusters %in% "17" ~ "B_cell",
+      seurat_clusters %in% "18" ~ "Th2_cell",
+      seurat_clusters %in% "19" ~ "Mast_cell",
+      seurat_clusters %in% "20" ~ "cDC1",
+      seurat_clusters %in% "21" ~ "migratoryDC",
+      TRUE                      ~ cell_subtype
+    )
+  )
+
+DimPlot(immune_integrated, group.by = "cell_subtype", label = TRUE, repel = TRUE) +
+  ggtitle("Immune subtypes post-Harmony integration")
+
+# ── 5. Propeller differential abundance testing ──────────────────────────────
+# The two experimental runs produced a few cell types that were only detected in one run 
+# These are excluded in the other run for statistical analysis (<small cell numbers are excluded)
+# Statsitics are then calculated for cell ytpes only in run 1 or 2 and for cell types in both runs
+
+all_cell_subtypes <- unique(immune_integrated$cell_subtype_final)
+
+exclude_run1 <- c("cDC2", "clMonocyte", "MHCII_CAM", "dividingMac1", "repopMG1")
+exclude_run2 <- c("B_cell", "cDC1", "diffMac", "dividingMac2", "duralCAM", "Mast_cell", "migDC", "Osteoclast", "repopMG2", "Th2")
+
+cell_types_in_both <- setdiff(all_cell_subtypes, c(exclude_run1, exclude_run2))
+
+exclude_run1_full <- c(exclude_run1, cell_types_in_both)
+exclude_run2_full <- c(exclude_run2, cell_types_in_both)
+
+cell_info <- immune_integrated@meta.data %>%
+  mutate(
+    barcode  = rownames(.),
+    clusters = cell_subtype_final,
+    samples  = sample,
+    group    = factor(timepoint, levels = c("CTL", "d5", "8w"))
+  ) %>%
+  filter(!is.na(clusters))
+
+cell_info_run1 <- cell_info %>% filter(grepl("^1_", samples) & !clusters %in% exclude_run1_full)
+cell_info_run2 <- cell_info %>% filter(grepl("^2_", samples) & !clusters %in% exclude_run2_full)
+cell_info_both <- cell_info %>% filter(!clusters %in% c(exclude_run1, exclude_run2))
+
+# Propeller – Run 1
+prop_run1 <- propeller(
+  clusters = cell_info_run1$clusters,
+  sample   = cell_info_run1$samples,
+  group    = cell_info_run1$group
+)
+prop_run1$Run <- "Run1"
+
+# Propeller – Run 2
+prop_run2 <- propeller(
+  clusters = cell_info_run2$clusters,
+  sample   = cell_info_run2$samples,
+  group    = cell_info_run2$group
+)
+prop_run2$Run <- "Run2"
+
+# Propeller – Both (shared cell types)
+prop_both <- propeller(
+  clusters = cell_info_both$clusters,
+  sample   = cell_info_both$samples,
+  group    = cell_info_both$group
+)
+prop_both$Run <- "Both"
+
+prop_results_immune <- bind_rows(prop_run1, prop_run2, prop_both)
+
+write_tsv(prop_results_immune, file.path(TABLES_DIR, "propeller_immune_by_run.tsv"))
+print(prop_results_immune)
+
+# ── 6. Tissue-stratified DE + volcano plots ──────────────────────────────────
+immune_ctx_lm <- subset(immune_integrated, tissue %in% c("Ctx", "Lm"))
+immune_dura   <- subset(immune_integrated, tissue == "Dura")
+
+Idents(immune_ctx_lm) <- "timepoint"
+immune_ctx_lm <- JoinLayers(immune_ctx_lm)
+
+Idents(immune_dura) <- "timepoint"
+immune_dura <- JoinLayers(immune_dura)
+
+comparisons <- list(
+  list(name = "d5_vs_CTL", ident1 = "d5",  ident2 = "CTL"),
+  list(name = "8w_vs_d5",  ident1 = "8w",  ident2 = "d5"),
+  list(name = "8w_vs_CTL", ident1 = "8w",  ident2 = "CTL")
+)
+
+de_results_immune <- list()
+
+for (comp in comparisons) {
+  de_ctx_lm <- FindMarkers(
+    immune_ctx_lm, ident.1 = comp$ident1, ident.2 = comp$ident2,
+    logfc.threshold = 0, min.pct = 0.01, test.use = "wilcox", only.pos = FALSE
+  )
+  de_ctx_lm$gene <- rownames(de_ctx_lm)
+  de_results_immune[[paste0("ctx_lm_", comp$name)]] <- de_ctx_lm
+  
+  de_dura <- FindMarkers(
+    immune_dura, ident.1 = comp$ident1, ident.2 = comp$ident2,
+    logfc.threshold = 0, min.pct = 0.01, test.use = "wilcox", only.pos = FALSE
+  )
+  de_dura$gene <- rownames(de_dura)
+  de_results_immune[[paste0("dura_", comp$name)]] <- de_dura
+}
+
+iwalk(de_results_immune, ~ write_tsv(.x, file.path(TABLES_DIR, paste0("DE_immune_", .y, ".tsv"))))
+
+# Volcano plots
+pdf(file.path(FIGURES_DIR, "immune_volcano_plots.pdf"), width = 7, height = 6)
+
+EnhancedVolcano(
+  de_results_immune$ctx_lm_d5_vs_CTL,
+  lab = de_results_immune$ctx_lm_d5_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm Immune: d5 vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_immune$ctx_lm_8w_vs_d5,
+  lab = de_results_immune$ctx_lm_8w_vs_d5$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm Immune: 8w vs d5",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_immune$ctx_lm_8w_vs_CTL,
+  lab = de_results_immune$ctx_lm_8w_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm Immune: 8w vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_immune$dura_d5_vs_CTL,
+  lab = de_results_immune$dura_d5_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura Immune: d5 vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_immune$dura_8w_vs_d5,
+  lab = de_results_immune$dura_8w_vs_d5$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura Immune: 8w vs d5",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_immune$dura_8w_vs_CTL,
+  lab = de_results_immune$dura_8w_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura Immune: 8w vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+dev.off()
+
+# ── 7. Nestin expression visualization ────────────────────────────────────────
+# Subset to macrophages to evaluate nestin expression in repopulating macrophages
+immune_macrophages_integrated <- subset(immune_integrated, cell_subtype %in% c("Macrophages", "dividingMacrophages", "Osteoclast-like_Macrophage"))
+
+macs_nestin_umap <- FeaturePlot(immune_macrophages_integrated, "Nes", cols = c("lightgrey", "red3")) + NoAxes()
+full_nestin_umap <- FeaturePlot(full, "Nes", cols = c("lightgrey", "red3")) + NoAxes()
+
+macs_nestin_umap | full_nestin_umap
+
+# Split by timepoint
+FeaturePlot(
+  immune_macrophages_integrated,
+  "Nes",
+  cols = c("lightgrey", "red3"),
+  split.by = "timepoint"
+) + NoAxes()
+
+ggsave(file.path(FIGURES_DIR, "nestin_expression_macrophages.pdf"), width = 12, height = 8)
+
+sessionInfo()
+
+
+# =============================================================================
+# Macrophage-focused sub-analysis (Ctx/Lm only) for end of Fig.2 
+# =============================================================================
+
+# ── Macrophage subset (Ctx/Lm only) ──────────────────────────────────────────
+macrophage_subtypes <- c(
+  "Lyve1_CAM", "MHCII_CAM", "homMG", "repopMG1", "repopMG2",
+  "dividingMac1", "dividingMac2", "diffMac"
+)
+
+immune_macrophages <- subset(
+  immune_ctx_lm,
+  subset = cell_subtype_final %in% macrophage_subtypes
+)
+
+cat("Macrophage subset (Ctx/Lm) contains", ncol(immune_macrophages), "cells\n")
+
+# ── Re-processing & subclustering ────────────────────────────────────────────
+immune_macrophages <- FindVariableFeatures(immune_macrophages, selection.method = "vst", nfeatures = 2000)
+immune_macrophages <- ScaleData(immune_macrophages)
+immune_macrophages <- RunPCA(immune_macrophages)
+ElbowPlot(immune_macrophages, ndims = 30)
+
+immune_macrophages <- RunUMAP(immune_macrophages, dims = 1:20)
+immune_macrophages <- FindNeighbors(immune_macrophages, dims = 1:20)
+immune_macrophages <- FindClusters(immune_macrophages, resolution = 1.1)
+
+immune_macrophages <- JoinLayers(immune_macrophages)
+
+# ── Harmony integration across runs (within macrophages) ─────────────────────
+immune_split <- immune_macrophages
+immune_split[["RNA"]] <- split(immune_split[["RNA"]], f = immune_macrophages$run)
+
+immune_macrophages_integrated <- IntegrateLayers(
+  immune_split,
+  method          = HarmonyIntegration,
+  orig.reduction  = "pca",
+  new.reduction   = "harmony"
+)
+
+immune_macrophages_integrated <- RunUMAP(immune_macrophages_integrated, reduction = "harmony", dims = 1:25)
+immune_macrophages_integrated <- FindNeighbors(immune_macrophages_integrated, dims = 1:25)
+immune_macrophages_integrated <- FindClusters(immune_macrophages_integrated, resolution = 0.6)
+
+DimPlot(immune_macrophages_integrated, group.by = c("run", "timepoint", "tissue", "seurat_clusters", "cell_subtype_final"))
+
+# ── Macrophage markers ───────────────────────────────────────────────────────
+immune_macrophages_integrated <- JoinLayers(immune_macrophages_integrated)
+
+Idents(immune_macrophages_integrated) <- "seurat_clusters"
+
+macs_markers <- FindAllMarkers(
+  immune_macrophages_integrated,
+  only.pos       = TRUE,
+  min.pct        = 0.2
+)
+
+macs_markers_sig <- macs_markers %>%
+  filter(p_val_adj < 0.05)
+
+write_tsv(macs_markers_sig, file.path(TABLES_DIR, "macrophage_markers_sig.tsv"))
+
+# ── Custom color palettes for macrophage plots ───────────────────────────────
+set.seed(5)
+pal_macs <- createPalette(
+  length(unique(immune_macrophages_integrated$cell_subtype_final)),
+  seedcolors = c("#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377", "#BBBBBB")
+)
+names(pal_macs) <- sort(unique(immune_macrophages_integrated$cell_subtype_final))
+
+pal_timepoint_mac <- createPalette(3, seedcolors = c("#F39C12", "#8E44AD", "#2ECC71"))
+names(pal_timepoint_mac) <- c("d5", "8w", "CTL")
+
+# Ensure factor levels
+immune_macrophages_integrated$timepoint <- factor(
+  immune_macrophages_integrated$timepoint,
+  levels = c("CTL", "d5", "8w")
+)
+
+# ── Visualization: Timepoint & subtype UMAPs ─────────────────────────────────
+DimPlot(
+  immune_macrophages_integrated,
+  group.by = "timepoint",
+  cols = pal_timepoint_mac,
+  alpha = 0.5,
+  pt.size = 0.5
+) + NoAxes() + ggtitle("Macrophages: Timepoint")
+
+DimPlot(
+  immune_macrophages_integrated,
+  group.by = "cell_subtype_final",
+  split.by = "timepoint",
+  cols = pal_macs,
+  alpha = 0.5,
+  pt.size = 0.5
+) + NoAxes() + ggtitle("Macrophages: Subtype split by timepoint")
+
+DimPlot(
+  immune_macrophages_integrated,
+  group.by = "cell_subtype_final",
+  cols = pal_macs,
+  pt.size = 0.4
+) + NoAxes() + ggtitle("Macrophages: Subtype overview")
+
+ggsave(
+  file.path(FIGURES_DIR, "macrophages_umaps_timepoint_subtype.pdf"),
+  width = 12, height = 8
+)
+
+sessionInfo()
