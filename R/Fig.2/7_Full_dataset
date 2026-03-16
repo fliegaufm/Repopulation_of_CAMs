@@ -1,6 +1,6 @@
 # =============================================================================
 # Project:   Revision Niche scRNA-seq – Full dataset visualization & statistics
-# Script:    01_full_dataset_visualization_and_stats.R
+# Script:    07_full_dataset_visualization_and_stats.R
 # Author:    Maximilian Fliegauf
 # Date:      11/2025
 # Purpose:   Load final integrated & annotated object → generate publication-ready
