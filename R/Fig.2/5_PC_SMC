@@ -1,6 +1,6 @@
 # =============================================================================
 # Project:   Revision Niche scRNA-seq – Pericyte / VSMC (PC) Sub-analysis
-# Script:    04_pericyte_vsmc_subclustering_and_analysis.R
+# Script:    05_pericyte_vsmc_subclustering_and_analysis.R
 # Author:    Maximilian Fliegauf
 # Date:      11/2025
 # Purpose:   Subset pericytes & VSMCs from full integrated object → re-cluster →
