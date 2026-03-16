@@ -1,6 +1,6 @@
 # =============================================================================
 # Project:   Revision Niche scRNA-seq – Immune Cell Subtype Analysis
-# Script:    05_immune_subclustering_and_analysis.R
+# Script:    06_immune_subclustering_and_analysis.R
 # Author:    Maximilian Fliegauf
 # Date:      11/2025
 # Purpose:   Subset immune cells from full integrated object → re-cluster →
