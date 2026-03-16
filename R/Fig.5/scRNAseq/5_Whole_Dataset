@@ -1,0 +1,81 @@
+# =============================================================================
+# Project:   CAMs scRNA-seq – Whole-dataset annotation
+# Script:    06_whole_dataset_final_annotation_and_cellchat.R
+# Author:    Maximilian Fliegauf
+# Date:      2024
+# Purpose:   Load integrated object → final manual annotation → 
+#            marker visualization 
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(CellChat)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(pheatmap)
+  library(ggsci)             # nice color palettes
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+
+INPUT_RDS     <- here("results/rds/cso_integr_looseFilter.rds")
+OUTPUT_ANNO_RDS <- here("results/rds/iso_full_anno.rds")
+TABLES_DIR    <- here("results/tables")
+FIGURES_DIR   <- here("results/figures/cellchat")
+
+dir.create(TABLES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load integrated object ────────────────────────────────────────────────
+iso <- readRDS(INPUT_RDS)
+
+DimPlot(iso, group.by = "seurat_clusters", label = TRUE, repel = TRUE) +
+  ggtitle("Clusters before final annotation")
+
+# ── 2. Final cell-type annotation ────────────────────────────────────────────
+
+cluster_markers <- FindAllMarkers(iso, group.by = "seurat_clusters")
+
+iso <- iso %>%
+  mutate_meta(
+    cell_type = case_when(
+      seurat_clusters %in% c(1,2,4,6,7,11,14)  ~ "MG",
+      seurat_clusters %in% c(0,3,5,8,10)       ~ "CAM",
+      seurat_clusters %in% "9"                 ~ "ncMono",
+      seurat_clusters %in% "12"                ~ "clMono",
+      seurat_clusters %in% "13"                ~ "cDC2",
+      seurat_clusters %in% "15"                ~ "Lymphos",
+      seurat_clusters %in% "16"                ~ "Neutro",
+      seurat_clusters %in% "17"                ~ "migDC",
+      TRUE                                     ~ "Unknown"
+    )
+  )
+
+# Interactive proliferating annotation (run once interactively)
+FeaturePlot(iso, features = c("Mki67"))
+ plot_div <- DimPlot(iso, reduction = "umap")
+ iso <- CellSelector(plot = plot_div, object = iso, ident = "dividing")
+ dividing_cells <- WhichCells(iso, idents = "dividing")
+ iso$cell_type[dividing_cells] <- "proliferating"
+
+DimPlot(iso, group.by = "cell_type", label = TRUE, repel = TRUE, pt.size = 0.5, label.size = 5) +
+  ggtitle("Final cell-type annotation")
+
+saveRDS(iso, OUTPUT_ANNO_RDS)
+iso <- readRDS(OUTPUT_ANNO_RDS)
+
+# ── 3. Core marker visualization ─────────────────────────────────────────────
+core_markers <- c(
+  "Mrc1", "Pf4", "Sparc", "Ly6c2", "Ace", "Cd209a", "Ccr7", "S100a8", "Mki67",
+  "Csf1r", "Tmem119", "Hexb", "Ccr2", "Cd79a", "Ly6g"
+)
+
+FeaturePlot(iso, features = core_markers, ncol = 4, pt.size = 0.4)
+DotPlot(iso, features = core_markers, group.by = "cell_type", dot.scale = 8) +
+  scale_color_gradient(low = "lightgrey", high = "forestgreen") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
