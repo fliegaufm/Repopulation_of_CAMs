@@ -1,0 +1,155 @@
+# =============================================================================
+# Project:   Revision Niche scRNA-seq – Niche/Mural Cell Subset Analysis
+# Script:    08_niche_mural_cell_subset_analysis.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Subset glial cells (Astro, Oligo/OPC, Schwann) from full integrated 
+#            object → re-cluster → Harmony integration across runs → 
+#            tissue-stratified DE/volcano plots (Ctx/Lm vs Dura)
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(Polychrome)        # createPalette
+  library(EnhancedVolcano)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+
+INPUT_RDS <- here("results/rds/full_dataset_final_after_integration_and_final_annotation.rds")
+
+TABLES_DIR  <- here("results/tables/glia")
+FIGURES_DIR <- here("results/figures/glia")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load & subset glial cells ─────────────────────────────────────────────
+full <- readRDS(INPUT_RDS)
+
+glia_subtypes <- c("Astro", "intermed_Oligo", "mature_Oligo", "OPC", "myel_SC", "non_myel_SC")
+
+glia <- subset(full, cell_subtype_final %in% glia_subtypes)
+
+cat("Glia subset contains", ncol(glia), "cells\n")
+
+# ── 2. Subclustering ─────────────────────────────────────────────────────────
+glia <- FindVariableFeatures(glia, selection.method = "vst", nfeatures = 2000)
+glia <- ScaleData(glia)
+glia <- RunPCA(glia)
+ElbowPlot(glia, ndims = 30)
+
+glia <- RunUMAP(glia, dims = 1:20)
+glia <- FindNeighbors(glia, dims = 1:20)
+glia_clustered <- FindClusters(glia, resolution = 1.1)
+
+DimPlot(glia_clustered, group.by = "run") + ggtitle("Glia: Run")
+
+# ── 3. Harmony integration across runs ───────────────────────────────────────
+glia_split <- glia_clustered
+glia_split[["RNA"]] <- split(glia_split[["RNA"]], f = glia_clustered$run)
+
+glia_integrated <- IntegrateLayers(
+  glia_split,
+  method          = HarmonyIntegration,
+  orig.reduction  = "pca",
+  new.reduction   = "harmony"
+)
+
+glia_integrated <- RunUMAP(glia_integrated, reduction = "harmony", dims = 1:25)
+glia_integrated <- FindNeighbors(glia_integrated, dims = 1:25)
+glia_integrated <- FindClusters(glia_integrated, resolution = 0.2)
+
+DimPlot(glia_integrated, group.by = c("run", "timepoint", "tissue", "seurat_clusters", "cell_subtype_final"))
+
+glia_integrated <- JoinLayers(glia_integrated)
+
+# ── 4. Tissue-stratified DE + volcano plots ──────────────────────────────────
+glia_ctx_lm <- subset(glia_integrated, tissue %in% c("Ctx", "Lm"))
+glia_dura   <- subset(glia_integrated, tissue == "Dura")
+
+Idents(glia_ctx_lm) <- "timepoint"
+Idents(glia_dura)   <- "timepoint"
+
+comparisons <- list(
+  list(name = "d5_vs_CTL", ident1 = "d5",  ident2 = "CTL"),
+  list(name = "8w_vs_d5",  ident1 = "8w",  ident2 = "d5"),
+  list(name = "8w_vs_CTL", ident1 = "8w",  ident2 = "CTL")
+)
+
+de_results_glia <- list()
+
+for (comp in comparisons) {
+  de_ctx_lm <- FindMarkers(
+    glia_ctx_lm, ident.1 = comp$ident1, ident.2 = comp$ident2,
+    logfc.threshold = 0, min.pct = 0.01, test.use = "wilcox", only.pos = FALSE
+  )
+  de_ctx_lm$gene <- rownames(de_ctx_lm)
+  de_results_glia[[paste0("ctx_lm_", comp$name)]] <- de_ctx_lm
+  
+  de_dura <- FindMarkers(
+    glia_dura, ident.1 = comp$ident1, ident.2 = comp$ident2,
+    logfc.threshold = 0, min.pct = 0.01, test.use = "wilcox", only.pos = FALSE
+  )
+  de_dura$gene <- rownames(de_dura)
+  de_results_glia[[paste0("dura_", comp$name)]] <- de_dura
+}
+
+iwalk(de_results_glia, ~ write_tsv(.x, file.path(TABLES_DIR, paste0("DE_glia_", .y, ".tsv"))))
+
+# Volcano plots – full glia
+pdf(file.path(FIGURES_DIR, "glia_volcano_plots.pdf"), width = 7, height = 6)
+
+EnhancedVolcano(
+  de_results_glia$ctx_lm_d5_vs_CTL,
+  lab = de_results_glia$ctx_lm_d5_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm Glia: d5 vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_glia$ctx_lm_8w_vs_d5,
+  lab = de_results_glia$ctx_lm_8w_vs_d5$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm Glia: 8w vs d5",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_glia$ctx_lm_8w_vs_CTL,
+  lab = de_results_glia$ctx_lm_8w_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm Glia: 8w vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_glia$dura_d5_vs_CTL,
+  lab = de_results_glia$dura_d5_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura Glia: d5 vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_glia$dura_8w_vs_d5,
+  lab = de_results_glia$dura_8w_vs_d5$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura Glia: 8w vs d5",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_glia$dura_8w_vs_CTL,
+  lab = de_results_glia$dura_8w_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura Glia: 8w vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+dev.off()
