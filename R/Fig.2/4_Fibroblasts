@@ -1,6 +1,6 @@
 # =============================================================================
 # Project:   Revision Niche scRNA-seq – Fibroblast Sub-analysis
-# Script:    02_fibroblast_subclustering_and_analysis.R
+# Script:    04_fibroblast_subclustering_and_analysis.R
 # Author:    Maximilian Fliegauf
 # Date:      11/2025
 # Purpose:   Subset fibroblasts from full integrated object → re-cluster →
