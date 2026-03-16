@@ -1,0 +1,247 @@
+# =============================================================================
+# Project:   Revision Niche scRNA-seq – Pericyte / VSMC (PC) Sub-analysis
+# Script:    04_pericyte_vsmc_subclustering_and_analysis.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Subset pericytes & VSMCs from full integrated object → re-cluster →
+#            → doublet exclusion → Harmony integration across runs
+#            propeller DA testing →
+#            tissue-stratified DE/volcano plots.
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(SingleCellExperiment)
+  library(EnhancedVolcano)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+
+INPUT_RDS <- here("results/rds/full_dataset_final_after_integration_and_final_annotation.rds")
+
+TABLES_DIR  <- here("results/tables/pc_vsmc")
+FIGURES_DIR <- here("results/figures/pc_vsmc")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load & subset pericytes / VSMCs ───────────────────────────────────────
+full <- readRDS(INPUT_RDS)
+
+pcs <- subset(
+  full,
+  annotation %in% c("Pericyte", "SMC") |
+  cell_subtype %in% c(
+    "contractilePC", "venousPC", "lmVSMC", "muralProgenitor", "duVSMC",
+    "arterialVSMC1", "arterialVSMC2", "activatedVSMC"
+  )
+)
+
+cat("Pericyte/VSMC subset contains", ncol(pcs), "cells\n")
+
+# ── 2. Initial subclustering ─────────────────────────────────────────────────
+pcs <- FindVariableFeatures(pcs, selection.method = "vst", nfeatures = 2000)
+pcs <- ScaleData(pcs)
+pcs <- RunPCA(pcs)
+ElbowPlot(pcs, ndims = 30)
+
+pcs <- RunUMAP(pcs, dims = 1:10)
+pcs <- FindNeighbors(pcs, dims = 1:10)
+pcs_clustered <- FindClusters(pcs, resolution = 1.0)
+
+# Diagnostic UMAPs
+DimPlot(pcs_clustered, group.by = c("timepoint", "tissue", "seurat_clusters", "cell_subtype", "run"))
+
+# ── 3. Harmony integration across runs ───────────────────────────────────────
+pcs_split <- pcs_clustered
+pcs_split[["RNA"]] <- split(pcs_split[["RNA"]], f = pcs_split$run)
+
+pcs_integrated <- IntegrateLayers(
+  pcs_split,
+  method          = HarmonyIntegration,
+  orig.reduction  = "pca",
+  new.reduction   = "harmony"
+)
+
+pcs_integrated <- RunUMAP(pcs_integrated, reduction = "harmony", dims = 1:20)
+pcs_integrated <- FindNeighbors(pcs_integrated, dims = 1:20)
+pcs_integrated <- FindClusters(pcs_integrated, resolution = 0.6)
+
+DimPlot(pcs_integrated, group.by = c("run", "tissue", "timepoint", "seurat_clusters", "cell_subtype_final"))
+
+saveRDS(pcs_integrated, here("results/rds/pcs_integrated.rds"))
+
+# ── 4. Post-integration markers & refined subtype annotation ──────────────────
+# Annotation is based on Pietilä, Vanlandewijck and others
+
+pcs_integrated <- JoinLayers(pcs_integrated)
+
+Idents(pcs_integrated) <- "cell_subtype_final"
+
+pc_markers <- FindAllMarkers(
+  pcs_integrated,
+  only.pos       = TRUE,
+  min.pct        = 0.25,
+  logfc.threshold = 0.5
+)
+
+pc_markers_sub <- pc_markers %>%
+  filter(p_val_adj < 0.01) %>%
+  group_by(cluster) %>%
+  slice_head(n = 50) %>%
+  ungroup()
+
+write_tsv(pc_markers_sub, file.path(TABLES_DIR, "pc_vsmc_post_integration_markers_top50.tsv"))
+
+# Apply PC/VSMC subtype annotation
+pcs_integrated <- pcs_integrated %>%
+  mutate_meta(
+    cell_subtype = case_when(
+      seurat_clusters %in% "0" ~ "capillaryPC",
+      seurat_clusters %in% "1" ~ "contractilePC",
+      seurat_clusters %in% "2" ~ "venousPC",
+      seurat_clusters %in% "3" ~ "lmVSMC",
+      seurat_clusters %in% "4" ~ "muralProgenitor",
+      seurat_clusters %in% "5" ~ "duVSMC",
+      seurat_clusters %in% "6" ~ "arterialVSMC1",
+      seurat_clusters %in% "7" ~ "arterialVSMC2",
+      seurat_clusters %in% "8" ~ "activatedVSMC",
+      TRUE                     ~ cell_subtype
+    )
+  )
+
+DimPlot(pcs_integrated, group.by = "cell_subtype", label = TRUE, repel = TRUE) +
+  ggtitle("PC/VSMC subtypes post-Harmony integration")
+
+# ── 5. Propeller differential abundance testing ──────────────────────────────
+# Prepare data: exclude non sorted cell types per run --> dural cells were only sorted in first experimental batch
+exclude_run2 <- c("duPC")
+exclude_run1 <- c()
+
+cell_info <- pcs_integrated@meta.data %>%
+  mutate(
+    barcode  = rownames(.),
+    clusters = cell_subtype_final,
+    samples  = sample,
+    group    = factor(timepoint, levels = c("CTL", "d5", "8w"))
+  ) %>%
+  filter(!is.na(clusters))
+
+cell_info_run1 <- cell_info %>% filter(grepl("^1_", samples) & !clusters %in% exclude_run1)
+cell_info_run2 <- cell_info %>% filter(grepl("^2_", samples) & !clusters %in% exclude_run2)
+
+# Propeller – Run 1
+prop_run1 <- propeller(
+  clusters = cell_info_run1$clusters,
+  sample   = cell_info_run1$samples,
+  group    = cell_info_run1$group
+)
+prop_run1$Run <- "Run1"
+
+# Propeller – Run 2
+prop_run2 <- propeller(
+  clusters = cell_info_run2$clusters,
+  sample   = cell_info_run2$samples,
+  group    = cell_info_run2$group
+)
+prop_run2$Run <- "Run2"
+
+prop_results_pcs <- bind_rows(prop_run1, prop_run2)
+
+write_tsv(prop_results_pcs, file.path(TABLES_DIR, "propeller_pc_vsmc_by_run.tsv"))
+print(prop_results_pcs)
+
+# ── 7. Tissue-stratified DE + volcano plots ──────────────────────────────────
+pcs_ctx_lm <- subset(pcs_integrated, tissue %in% c("Ctx", "Lm"))
+pcs_dura   <- subset(pcs_integrated, tissue == "Dura")
+
+Idents(pcs_ctx_lm) <- "timepoint"
+pcs_ctx_lm <- JoinLayers(pcs_ctx_lm)
+
+Idents(pcs_dura) <- "timepoint"
+pcs_dura <- JoinLayers(pcs_dura)
+
+comparisons <- list(
+  list(name = "d5_vs_CTL", ident1 = "d5",  ident2 = "CTL"),
+  list(name = "8w_vs_d5",  ident1 = "8w",  ident2 = "d5"),
+  list(name = "8w_vs_CTL", ident1 = "8w",  ident2 = "CTL")
+)
+
+de_results_pc <- list()
+
+for (comp in comparisons) {
+  de_ctx_lm <- FindMarkers(
+    pcs_ctx_lm, ident.1 = comp$ident1, ident.2 = comp$ident2,
+    logfc.threshold = 0, min.pct = 0.01, test.use = "wilcox", only.pos = FALSE
+  )
+  de_ctx_lm$gene <- rownames(de_ctx_lm)
+  de_results_pc[[paste0("ctx_lm_", comp$name)]] <- de_ctx_lm
+  
+  de_dura <- FindMarkers(
+    pcs_dura, ident.1 = comp$ident1, ident.2 = comp$ident2,
+    logfc.threshold = 0, min.pct = 0.01, test.use = "wilcox", only.pos = FALSE
+  )
+  de_dura$gene <- rownames(de_dura)
+  de_results_pc[[paste0("dura_", comp$name)]] <- de_dura
+}
+
+iwalk(de_results_pc, ~ write_tsv(.x, file.path(TABLES_DIR, paste0("DE_pc_vsmc_", .y, ".tsv"))))
+
+# Volcano plots
+pdf(file.path(FIGURES_DIR, "pc_vsmc_volcano_plots.pdf"), width = 7, height = 6)
+
+EnhancedVolcano(
+  de_results_pc$ctx_lm_d5_vs_CTL,
+  lab = de_results_pc$ctx_lm_d5_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm PC/VSMC: d5 vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_pc$ctx_lm_8w_vs_d5,
+  lab = de_results_pc$ctx_lm_8w_vs_d5$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm PC/VSMC: 8w vs d5",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_pc$ctx_lm_8w_vs_CTL,
+  lab = de_results_pc$ctx_lm_8w_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm PC/VSMC: 8w vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_pc$dura_d5_vs_CTL,
+  lab = de_results_pc$dura_d5_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura PC/VSMC: d5 vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_pc$dura_8w_vs_d5,
+  lab = de_results_pc$dura_8w_vs_d5$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura PC/VSMC: 8w vs d5",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_pc$dura_8w_vs_CTL,
+  lab = de_results_pc$dura_8w_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura PC/VSMC: 8w vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+dev.off()
+
+sessionInfo()
