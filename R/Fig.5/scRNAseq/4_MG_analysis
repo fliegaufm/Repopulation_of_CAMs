@@ -1,0 +1,225 @@
+# =============================================================================
+# Project:   CAMs scRNA-seq – Sub-analysis of MG population
+# Script:    Downstream_analysis_MG.R
+# Author:    Max Fliegauf
+# Date:      2024
+# Purpose:   Subset MG → re-process → integration → sub-clustering →
+#            differential expression → visualization
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(gridExtra)
+  library(ggpubr)
+  library(rstatix)
+  library(VennDiagram)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(speckle)          # propeller
+  library(SingleCellExperiment)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+
+INPUT_RDS     <- here("results/rds/cso_integr_looseFilter.rds")
+OUTPUT_MG_RDS <- here("results/rds/iMGs_looseFilter.rds")
+TABLES_DIR    <- here("results/tables")
+FIGURES_DIR   <- here("results/figures")
+
+dir.create(TABLES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+HVF_NFEATURES_MG <- 2000
+PCA_DIMS_MG      <- 1:12
+UMAP_DIMS_MG     <- 1:10
+RES_PRE_INT      <- 0.4
+RES_INTEGRATED   <- 0.25
+
+EXCLUDE_PATTERNS <- c("^mt-", "^Rp[sl][[:digit:]]", "^Rpsa", "tdTomato", "cre", "WPRE-QY")
+
+# ── 1. Load & subset MG population ───────────────────────────────────────────
+iso <- readRDS(INPUT_RDS)
+Idents(iso) <- "cell_type"
+MG <- subset(iso, idents = c("MG", "activMG"))
+
+cat("MG subset contains", ncol(MG), "cells\n")
+
+# Remove old integrated assay
+MG[["integrated"]] <- NULL
+DefaultAssay(MG) <- "RNA"
+
+# ── 2. Standard preprocessing ────────────────────────────────────────────────
+MG <- NormalizeData(MG)
+MG <- FindVariableFeatures(MG, selection.method = "vst", nfeatures = HVF_NFEATURES_MG)
+
+# Exclude unwanted genes from HVF
+var_features <- VariableFeatures(MG)
+exclude <- grepl(paste(EXCLUDE_PATTERNS, collapse = "|"), rownames(MG))
+VariableFeatures(MG) <- var_features[!var_features %in% rownames(MG)[exclude]]
+
+MG <- ScaleData(MG, features = VariableFeatures(MG))
+MG <- RunPCA(MG, features = VariableFeatures(MG))
+
+ElbowPlot(MG, ndims = 30)
+
+# ── 3. Pre-integration clustering ────────────────────────────────────────────
+MG <- RunUMAP(MG, dims = PCA_DIMS_MG)
+MG <- FindNeighbors(MG, dims = PCA_DIMS_MG)
+MG <- FindClusters(MG, resolution = RES_PRE_INT)
+
+DimPlot(MG, label = TRUE) + ggtitle("MG pre-integration")
+DimPlot(MG, group.by = "batch")
+DimPlot(MG, group.by = "condition")
+
+# ── 4. CCA integration ───────────────────────────────────────────────────────
+obj_list <- SplitObject(MG, split.by = "batch")
+
+anchors <- FindIntegrationAnchors(
+  object.list = obj_list,
+  reduction   = "cca",
+  dims        = PCA_DIMS_MG,
+  max.features = HVF_NFEATURES_MG
+)
+
+integrated <- IntegrateData(anchorset = anchors, dims = PCA_DIMS_MG)
+
+MG_int <- MG
+MG_int[["integrated"]] <- integrated[["integrated"]]
+DefaultAssay(MG_int) <- "integrated"
+
+# Optional: remove RNA assay if forcing integrated usage
+# MG_int[["RNA"]] <- NULL
+
+# ── 5. Post-integration workflow ─────────────────────────────────────────────
+MG_int <- ScaleData(MG_int)
+MG_int <- RunPCA(MG_int)
+MG_int <- RunUMAP(MG_int, dims = UMAP_DIMS_MG)
+MG_int <- FindNeighbors(MG_int, dims = UMAP_DIMS_MG)
+MG_int <- FindClusters(MG_int, resolution = RES_INTEGRATED)
+
+# Quick diagnostics
+DimPlot(MG_int, group.by = c("seurat_clusters", "condition", "batch"), ncol = 3)
+FeaturePlot(MG_int, "tdT", split.by = "condition", pt.size = 0.6)
+
+saveRDS(MG_int, OUTPUT_MG_RDS)
+# MG_int <- readRDS(OUTPUT_MG_RDS)
+
+# ── 6. Manual IFN-MG annotation (interactive part) ───────────────────────────
+# Run interactively once — then save object
+plot_INF <- FeaturePlot(MG_int, features = "Isg15")
+MG_int <- CellSelector(plot = plot_INF, object = MG_int, ident = "INF_MG")
+
+# Transfer selection to metadata
+inf_cells <- WhichCells(MG_int, idents = "INF_MG")
+MG_int$cell_type[inf_cells] <- "IFN_MG"
+
+DimPlot(MG_int, group.by = "cell_type")
+
+# ── 7. Preliminary & final sub-annotation ────────────────────────────────────
+MG_int <- MG_int %>%
+  mutate_meta(
+    MG_preliminary = case_when(
+      seurat_clusters %in% c("0") ~ "homMG1",
+      seurat_clusters %in% c("1") ~ "homMG2",
+      seurat_clusters %in% c("2") ~ "homMG3",
+      seurat_clusters %in% c("3") ~ "activated_phenotype_MG",
+      cell_type      == "IFN_MG"  ~ "Type_1_INF_MG",
+      TRUE                        ~ "Unknown"
+    ),
+    MG_subtype = MG_preliminary,
+    MG_clusters = case_when(
+      MG_preliminary == "homMG1"              ~ "0",
+      MG_preliminary == "homMG2"              ~ "1",
+      MG_preliminary == "homMG3"              ~ "2",
+      MG_preliminary == "activated_phenotype_MG" ~ "3",
+      MG_preliminary == "Type_1_INF_MG"       ~ "4",
+      TRUE                                    ~ "Unknown"
+    )
+  )
+
+# Set factor order
+MG_int$MG_clusters <- factor(MG_int$MG_clusters, levels = c("0","1","2","3","4"))
+MG_int$MG_subtype  <- factor(MG_int$MG_subtype,  levels = c("homMG1","homMG2","homMG3","activated_MG","Type_1_INF_MG"))
+
+DimPlot(MG_int, group.by = "MG_subtype", label = TRUE, cols = pal_npg("nrc")(5))
+
+# ── 8. Cluster proportion statistics & visualization ─────────────────────────
+cluster_prop_strat <- function(seu) {
+  seu@meta.data %>%
+    mutate(cluster = as.character(seurat_clusters)) %>%
+    group_by(orig.ident, condition, cluster) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    left_join(
+      group_by(., orig.ident, condition) %>% summarise(total = sum(n)),
+      by = c("orig.ident", "condition")
+    ) %>%
+    mutate(percentage = 100 * n / total)
+}
+
+prop_df <- cluster_prop_strat(MG_int)
+
+summary_prop <- prop_df %>%
+  group_by(cluster, condition) %>%
+  summarise(mean_perc = mean(percentage), sd_perc = sd(percentage), .groups = "drop")
+
+plot_prop <- left_join(prop_df, summary_prop, by = c("cluster", "condition"))
+
+# Bar + error + jitter + p-values
+ggplot(plot_prop, aes(cluster, percentage, fill = condition)) +
+  geom_bar(stat = "summary", fun = "mean", position = position_dodge()) +
+  geom_errorbar(stat = "summary", fun.data = mean_se, position = position_dodge(0.9), width = 0.2) +
+  geom_jitter(aes(color = condition), position = position_jitterdodge()) +
+  stat_compare_means(method = "t.test", label = "p.format") +
+  theme_minimal() +
+  labs(title = "MG cluster proportions by condition", y = "% of cells")
+
+# Propeller DA test
+sce_prop <- as.SingleCellExperiment(MG_int)
+colData(sce_prop)$sample  <- MG_int$orig.ident
+colData(sce_prop)$group   <- MG_int$condition
+colData(sce_prop)$cluster <- MG_int$seurat_clusters
+
+prop_res <- propeller(
+  sce       = sce_prop,
+  clusters  = sce_prop$cluster,
+  group     = sce_prop$group,
+  sample    = sce_prop$sample,
+  transform = "asin"
+)
+
+write_tsv(prop_res, file.path(TABLES_DIR, "propeller_MG_clusters.tsv"))
+
+# ── 9. Marker finding ────────────────────────────────────────────────────────
+Idents(MG_int) <- "seurat_clusters"
+markers_all <- FindAllMarkers(MG_int, only.pos = TRUE, logfc.threshold = 0.25, min.pct = 0.1)
+write_tsv(markers_all, file.path(TABLES_DIR, "MG_cluster_markers.tsv"))
+
+# Condition-level
+Idents(MG_int) <- "condition"
+cond_markers <- FindMarkers(MG_int, ident.1 = "BLZ", ident.2 = "CTL", min.pct = 0.2)
+write_tsv(cond_markers %>% rownames_to_column("gene"), file.path(TABLES_DIR, "MG_condition_markers.tsv"))
+
+# ── 10. Volcano plot (condition-level) ───────────────────────────────────────
+volcano_basic <- function(markers, title = "DEGs CTL vs BLZ in MG") {
+  markers %>%
+    mutate(sig = p_val_adj < 0.05 & abs(avg_log2FC) > 0.59) %>%
+    ggplot(aes(avg_log2FC, -log10(p_val_adj), color = sig)) +
+    geom_point(size = 1.2, alpha = 0.8) +
+    scale_color_manual(values = c("grey70", "#E41A1C")) +
+    geom_vline(xintercept = c(-0.59, 0.59), linetype = "dashed", color = "forestgreen") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "forestgreen") +
+    labs(title = title, x = "log2 Fold Change", y = "-log10(adj. p)") +
+    theme_minimal()
+}
+
+print(volcano_basic(cond_markers))
+
+# ── 11. Core marker visualization ────────────────────────────────────────────
+core_mg_genes <- c("P2ry12", "Sparc", "Hexb", "Siglech", "Inpp4b", "Gab2", "Slc9a9", "Hes1", "Ftl1", "Ctsl", "Spp1", "Itgax", "Cst7", "Isg15", "Ifit2", "Ifit1")
+
+VlnPlot(MG_int, features = core_mg_genes, group.by = "MG_subtype", ncol = 4, pt.size = 0.3)
+FeaturePlot(MG_int, features = core_mg_genes, ncol = 4)
