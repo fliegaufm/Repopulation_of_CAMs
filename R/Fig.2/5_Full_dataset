@@ -1,0 +1,351 @@
+# =============================================================================
+# Project:   Revision Niche scRNA-seq – Full dataset visualization & statistics
+# Script:    01_full_dataset_visualization_and_stats.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Load final integrated & annotated object → generate publication-ready
+#            UMAPs with consistent palettes → stacked/Marimekko proportion plots →
+#            dotplots & violins for marker/niche genes → statistical testing (Tukey)
+#            of niche factor expression changes across timepoints.
+#
+#   - Custom persistent color palettes for annotation, subtypes, tissue, timepoint, phase
+#   - Logic for run-specific cell types in proportion plots
+#   - Marimekko plots ordered by dominant category + percentage labels
+#   - Comparison of niche factors (Il34, Csf1, Tgfb1, etc.)
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(Polychrome)        # createPalette
+  library(rstatix)           # tukey_hsd
+  library(scales)            # percent_format
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/01_full_dataset_visualization_and_stats.R")
+
+INPUT_RDS <- here("results/rds/full_dataset_final_after_integration_and_final_annotation.rds")
+
+TABLES_DIR  <- here("results/tables")
+FIGURES_DIR <- here("results/figures/full_dataset")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load final integrated object ──────────────────────────────────────────
+full <- readRDS(INPUT_RDS)
+
+# Quick sanity check
+cat("Final object contains", ncol(full), "cells and", length(unique(full$cell_subtype_final)), "subtypes\n")
+
+# ── 2. Define persistent color palettes ──────────────────────────────────────
+# Annotation (broad classes) – 5–7 colors
+pal_annotation <- createPalette(
+  length(unique(full$annotation)),
+  seedcolors = c("#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377", "#BBBBBB")
+)
+names(pal_annotation) <- sort(unique(full$annotation))
+
+# Cell subtype (fine-grained) – up to 45 colors
+set.seed(10)
+pal_subtype <- createPalette(
+  length(unique(full$cell_subtype_final)),
+  seedcolors = c("#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377", "#BBBBBB")
+)
+names(pal_subtype) <- sort(unique(full$cell_subtype_final))
+
+# Tissue – 3 colors
+pal_tissue <- createPalette(3, seedcolors = c("#4477AA", "#228833", "#EE6677"))
+names(pal_tissue) <- c("Dura", "Lm", "Ctx")
+
+# Timepoint – 3 colors
+pal_timepoint <- createPalette(3, seedcolors = c("#F39C12", "#8E44AD", "#2ECC71"))
+names(pal_timepoint) <- c("CTL", "d5", "8w")
+
+# Cell cycle phase – 3 colors
+pal_phase <- c(G1 = "#228833", S = "#66CCEE", G2M = "#AA3377")
+
+# ── 3. Publication-ready UMAPs ───────────────────────────────────────────────
+p_anno <- DimPlot(
+  full, group.by = "annotation", label = TRUE, cols = pal_annotation,
+  pt.size = 0.5, repel = TRUE
+) + NoAxes() + ggtitle("Broad annotation")
+
+p_subtype <- DimPlot(
+  full, group.by = "cell_subtype_final", cols = pal_subtype,
+  pt.size = 0.4, label = FALSE
+) + NoAxes() + ggtitle("Cell subtype (fine)")
+
+p_tissue <- DimPlot(
+  full, group.by = "tissue", cols = pal_tissue, alpha = 0.5, pt.size = 0.5
+) + NoAxes() + ggtitle("Tissue")
+
+p_time <- DimPlot(
+  full, group.by = "timepoint", cols = pal_timepoint, alpha = 0.5, pt.size = 0.5
+) + NoAxes() + ggtitle("Timepoint")
+
+p_phase <- DimPlot(
+  full, group.by = "Phase", cols = pal_phase, alpha = 0.5, pt.size = 0.5
+) + NoAxes() + ggtitle("Cell cycle phase")
+
+# Combine and save
+(p_anno | p_subtype) / (p_tissue | p_time | p_phase) +
+  plot_layout(guides = "collect") & theme(legend.position = "right")
+
+ggsave(file.path(FIGURES_DIR, "umaps_overview.pdf"), width = 14, height = 10)
+
+# ── 4. Cell-type × sample count table ────────────────────────────────────────
+tab <- table(full$cell_subtype_final, full$sample)
+write.table(
+  as.data.frame.matrix(tab),
+  file = file.path(TABLES_DIR, "celltype_sample_counts.txt"),
+  sep = "\t", quote = FALSE, col.names = NA
+)
+
+# ── 5. Load / combine propeller results from sub-analyses ─────────────────────
+# After running propeller separately on immune/fibro/PC/EC and saved results
+# Propeller is run seperately per sorted gate --> CD31, PDPN, DN and CD45
+# Adjust paths/names if needed
+
+# Example placeholder – replace with your actual files
+prop_immune <- read_tsv(file.path(TABLES_DIR, "propeller_immune.tsv"))
+prop_fibros <- read_tsv(file.path(TABLES_DIR, "propeller_fibros.tsv"))
+prop_pcs    <- read_tsv(file.path(TABLES_DIR, "propeller_pcs.tsv"))
+prop_ecs    <- read_tsv(file.path(TABLES_DIR, "propeller_ecs.tsv"))
+
+prop_all <- bind_rows(
+  prop_immune, prop_fibros, prop_pcs, prop_ecs
+) %>%
+  rownames_to_column("cell_subtype_final")
+
+write_tsv(prop_all, file.path(TABLES_DIR, "propeller_all_cell_types.tsv"))
+
+# ── 6. Marimekko: Timepoint proportions per cell subtype ──────────────────────
+marimekko_data <- full@meta.data %>%
+  mutate(barcode = rownames(.)) %>%
+  filter(!is.na(cell_subtype_final))
+
+# Define cell types to exclude per run (your original logic)
+exclude_run2 <- c(
+  "art_duEC", "arterialEC", "B_cell", "capillaryEC1", "capillaryEC2",
+  "cDC1", "diffMac", "dividingMac2", "duFB1", "duFB2", "duPC",
+  "duralCAM", "Erythrocyte", "iegEC", "Mast_cell", "migDC", "myel_SC",
+  "non_myel_SC", "OPC", "Osteoclast", "periostalFB", "repopMG2", "Th2",
+  "ven_duEC", "venousEC"
+)
+
+exclude_run1 <- c(
+  "cDC2", "clMonocyte", "dividingMac1", "intermed_Oligo", "mature_Oligo",
+  "MHCII_CAM", "pvFB1", "pvFB2", "repopMG1", "venousVSMC"
+)
+
+barcodes_exclude <- rownames(full@meta.data)[
+  (full@meta.data$cell_subtype_final %in% exclude_run2 & grepl("^2_", full@meta.data$sample)) |
+  (full@meta.data$cell_subtype_final %in% exclude_run1 & grepl("^1_", full@meta.data$sample))
+]
+
+marimekko_data <- marimekko_data %>%
+  filter(!(barcode %in% barcodes_exclude))
+
+# Calculate proportions & order subtypes by overall abundance
+subtype_props <- marimekko_data %>%
+  group_by(cell_subtype_final) %>%
+  summarise(count = n(), prop = n() / nrow(marimekko_data)) %>%
+  arrange(desc(prop))
+
+cell_subtype_order <- subtype_props$cell_subtype_final
+
+# Prepare plot data
+plot_data <- marimekko_data %>%
+  group_by(cell_subtype_final, timepoint) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(cell_subtype_final) %>%
+  mutate(
+    subtype_total  = sum(count),
+    timepoint_prop = count / subtype_total
+  ) %>%
+  ungroup() %>%
+  mutate(
+    cell_subtype_final = factor(cell_subtype_final, levels = cell_subtype_order),
+    timepoint          = factor(timepoint, levels = c("CTL", "d5", "8w"))
+  )
+
+# Calculate bar positions with small gaps
+fixed_gap <- 0.01
+bar_pos <- plot_data %>%
+  distinct(cell_subtype_final) %>%
+  mutate(
+    bar_width = subtype_props$prop[match(cell_subtype_final, subtype_props$cell_subtype_final)],
+    bar_start = cumsum(lag(bar_width, default = 0) + fixed_gap),
+    bar_end   = bar_start + bar_width,
+    bar_center = (bar_start + bar_end) / 2
+  )
+
+plot_data <- plot_data %>%
+  left_join(bar_pos, by = "cell_subtype_final") %>%
+  group_by(cell_subtype_final) %>%
+  arrange(timepoint) %>%
+  mutate(
+    y_start  = cumsum(lag(timepoint_prop, default = 0)),
+    y_end    = y_start + timepoint_prop,
+    y_center = (y_start + y_end) / 2,
+    label    = ifelse(timepoint_prop >= 0.05, sprintf("%.1f%%", timepoint_prop * 100), "")
+  ) %>%
+  ungroup()
+
+# Significant FDR annotations (from propeller)
+fdr_anno <- prop_all %>%
+  filter(FDR < 0.05) %>%
+  mutate(
+    cell_subtype_final = rownames(.),
+    timepoint = case_when(
+      abs(PropMean.d5 - PropMean.CTL) >= abs(PropMean.8w - PropMean.CTL) ~ "d5",
+      TRUE ~ "8w"
+    ),
+    fdr_label = format(FDR, scientific = TRUE, digits = 2)
+  ) %>%
+  left_join(plot_data, by = c("cell_subtype_final", "timepoint")) %>%
+  filter(!is.na(bar_center))
+
+# Plot
+marimekko_time <- ggplot(plot_data) +
+  geom_rect(aes(xmin = bar_start, xmax = bar_end, ymin = y_start, ymax = y_end, fill = timepoint)) +
+  geom_text(aes(x = bar_center, y = y_center, label = label), size = 2.5, color = "white", fontface = "bold") +
+  geom_text(data = fdr_anno, aes(x = bar_center, y = y_center + 0.05, label = fdr_label),
+            size = 2.5, color = "black", fontface = "italic") +
+  scale_fill_manual(values = pal_timepoint, name = "Timepoint") +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(
+    breaks = bar_pos$bar_center,
+    labels = bar_pos$cell_subtype_final,
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Cell subtype",
+    y = "Proportion within subtype",
+    title = "Timepoint composition per cell subtype (ordered by abundance)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+print(marimekko_time)
+ggsave(file.path(FIGURES_DIR, "marimekko_timepoint_per_subtype.pdf"), width = 16, height = 9)
+
+# ── 7. Stacked bar: Tissue proportions per cell subtype ───────────────────────
+stacked_tissue <- marimekko_data %>%
+  group_by(tissue, cell_subtype_final) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(tissue) %>%
+  mutate(prop = count / sum(count)) %>%
+  ungroup() %>%
+  mutate(
+    tissue = factor(tissue, levels = names(pal_tissue)),
+    cell_subtype_final = factor(cell_subtype_final, levels = cell_subtype_order)
+  ) %>%
+  group_by(tissue) %>%
+  arrange(cell_subtype_final) %>%
+  mutate(
+    y_start  = cumsum(lag(prop, default = 0)),
+    y_end    = y_start + prop,
+    y_center = (y_start + y_end) / 2,
+    label    = ifelse(prop >= 0.05, sprintf("%.1f%%", prop * 100), "")
+  ) %>%
+  ungroup()
+
+ggplot(stacked_tissue) +
+  geom_col(aes(x = tissue, y = prop, fill = cell_subtype_final), position = "stack", width = 0.7, color = "white") +
+  geom_text(aes(x = tissue, y = y_center, label = label), size = 3.5, color = "white", fontface = "bold") +
+  scale_fill_manual(values = pal_subtype, name = "Cell subtype") +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    x = "Tissue",
+    y = "Proportion within tissue",
+    title = "Cell subtype composition per tissue"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    panel.grid.major.x = element_blank(),
+    legend.position = "right"
+  )
+
+ggsave(file.path(FIGURES_DIR, "stacked_tissue_per_subtype.pdf"), width = 10, height = 8)
+
+# ── 8. DotPlot – Core markers & niche/signaling genes ─────────────────────────
+# Core markers (your selection)
+core_markers <- c(
+  "Pecam1", "Plvap", "Vwf", "Vcam1", "Mfsd2a", "Tfrc", "Hey1", "Fos",
+  "Col1a1", "Bglap", "Slc47a1", "Ccl19", "Igf1", "Postn", "Vtn", "Cald1",
+  "Pdgfrb", "Rgs5", "Kcnj8", "Acta2", "Cnn1", "Grm3",
+  "Ptprc", "Lyve1", "Cd74", "Mrc1", "P2ry12", "Fcer1g", "Slc2a6", "Siglech",
+  "Mki67", "Top2a", "Acp5", "Ly6c2", "Ace", "Xcr1", "Cd209a", "Ccr7",
+  "S100a8", "Igkc", "Gata3", "Nkg7", "Fcer1a",
+  "Ncmap", "Gfra3", "Slc1a3", "Pak7", "Qki", "Mbp", "Hemgn"
+)
+
+Idents(full) <- "cell_subtype_final"
+full$cell_subtype_final <- factor(full$cell_subtype_final, levels = cell_subtype_order)
+
+DotPlot(full, features = core_markers, dot.scale = 3, cols = c("lightgrey", "darkgreen")) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+    axis.text.y = element_text(size = 6)
+  ) +
+  ggtitle("Core markers across cell subtypes")
+
+ggsave(file.path(FIGURES_DIR, "dotplot_core_markers.pdf"), width = 14, height = 10)
+
+# Integrins
+integrins <- c("Itgam", "Itga4", "Itga5", "Itgav", "Itgb1", "Itgb2", "Itgb3", "Itgb5", "Itgb7",
+               "Sele", "Sell", "Selp", "Selplg", "Vcam1", "Icam1", "Madcam1")
+
+DotPlot(full, features = integrins, dot.scale = 2.5) +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(size = 6, angle = 45))
+
+# Chemokines & receptors (small set)
+chem_small <- c("Ccl2", "Ccl3", "Ccl4", "Ccl6", "Ccl7", "Ccl9", "Ccl12", "Tnf", "Ccr2", "Cxcr4", "Tnfrsf1a", "Tnfrsf1b")
+
+DotPlot(full, features = chem_small, dot.scale = 2.5, cols = c("#2A6A6D", "#FFC107")) +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(size = 6, angle = 45))
+
+# Growth factors
+growth_factors <- c("Csf1", "Il34", "Csf1r", "Igf1", "Igf1r", "Tgfb1", "Tgfb2", "Tgfb3", "Tgfbr1", "Tgfbr2")
+
+DotPlot(full, features = growth_factors, dot.scale = 2.5, cols = c("#2A6A6D", "#FFC107")) +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(size = 6, angle = 45))
+
+# ── 9. Niche factor expression – Violin plots  ────────────────────
+niche_celltypes <- c(
+  "ven_duEC", "art_duEC", "venousEC", "capillaryEC1", "capillaryEC2",
+  "arterialEC", "iegEC",
+  "periostalFB", "duFB1", "duFB2", "araFB", "pialFB", "pvFB1", "pvFB2",
+  "duPC", "PC", "venousVSMC", "arterialVSMC",
+  "myel_SC", "non_myel_SC", "Astro", "OPC", "intermed_Oligo", "mature_Oligo"
+)
+
+niche_only <- subset(full, subset = cell_subtype_final %in% niche_celltypes)
+
+niche_only$cell_subtype_final <- factor(niche_only$cell_subtype_final, levels = niche_celltypes)
+niche_only$timepoint <- factor(niche_only$timepoint, levels = c("CTL", "d5", "8w"))
+
+niche_genes <- c("Il34", "Csf1", "Tgfb1", "Tgfb2", "Il33", "Cx3cl1", "Cxcl12")
+
+VlnPlot(
+  niche_only, features = niche_genes, split.by = "timepoint", cols = pal_timepoint,
+  pt.size = 0, ncol = 4
+) + NoLegend() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(FIGURES_DIR, "vln_niche_factors_timepoint.pdf"), width = 14, height = 10)
+
+# -------------------------
+sessionInfo()
