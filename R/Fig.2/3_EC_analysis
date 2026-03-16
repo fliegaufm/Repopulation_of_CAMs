@@ -93,6 +93,7 @@ DimPlot(ecs_clustered, group.by = "cell_subtype", label = TRUE, repel = TRUE) +
 
 
 # ── 4. Propeller Testing ────────────────────────────────────────────
+# ECs were only sorted in the first experinmental run --> Propeller testing on all ECs
 
 # Set seed for reproducibility
   set.seed(123)
