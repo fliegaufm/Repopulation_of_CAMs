@@ -1,0 +1,284 @@
+# =============================================================================
+# Project:   Revision Niche scRNA-seq – Fibroblast Sub-analysis
+# Script:    02_fibroblast_subclustering_and_analysis.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Subset fibroblasts from full integrated object → re-cluster →
+#            find markers → manual subtype annotation → doublet removal →
+#            Harmony integration across runs → re-annotation → propeller DA testing →
+#            tissue-stratified DE/volcano
+#
+#   - Fibro subtype annotation
+#   - Propeller testing split by run (with logic)
+#   - Tissue-stratified DE (Ctx/Lm vs Dura) + volcano
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(patchwork)
+  library(ggplot2)
+  library(tidyverse)
+  library(speckle)           # propeller
+  library(SingleCellExperiment)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(enrichplot)
+  library(EnhancedVolcano)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+
+INPUT_RDS <- here("results/rds/full_dataset_final_after_integration_and_final_annotation.rds")
+
+TABLES_DIR  <- here("results/tables/fibro")
+FIGURES_DIR <- here("results/figures/fibro")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load & subset fibroblasts ─────────────────────────────────────────────
+full <- readRDS(INPUT_RDS)
+
+fibros <- subset(full, annotation == "Fibro")
+
+cat("Fibroblast subset contains", ncol(fibros), "cells\n")
+
+# ── 2. Initial subclustering ─────────────────────────────────────────────────
+fibros <- FindVariableFeatures(fibros, selection.method = "vst", nfeatures = 2000)
+fibros <- ScaleData(fibros)
+fibros <- RunPCA(fibros)
+ElbowPlot(fibros, ndims = 30)
+
+fibros <- RunUMAP(fibros, dims = 1:20)
+fibros <- FindNeighbors(fibros, dims = 1:20)
+fibros_clustered <- FindClusters(fibros, resolution = 1.1)
+
+# Diagnostic UMAPs
+DimPlot(fibros_clustered, group.by = c("timepoint", "tissue", "seurat_clusters", "cell_subtype_final"))
+
+# ── 3. Doublet exclusion ─────────────────────────────────────────────────────
+fibros_clustered <- subset(fibros_clustered, subset = cell_subtype != "doublets")
+
+cat("Cells after doublet removal:", ncol(fibros_clustered), "\n")
+
+# ── 4. Harmony integration across runs ───────────────────────────────────────
+fibros_split <- fibros_clustered
+fibros_split[["RNA"]] <- split(fibros_split[["RNA"]], f = fibros_split$run)
+
+fibros_integrated <- IntegrateLayers(
+  fibros_split,
+  method          = HarmonyIntegration,
+  orig.reduction  = "pca",
+  new.reduction   = "harmony"
+)
+
+fibros_integrated <- RunUMAP(fibros_integrated, reduction = "harmony", dims = 1:20)
+fibros_integrated <- FindNeighbors(fibros_integrated, dims = 1:20)
+fibros_integrated <- FindClusters(fibros_integrated, resolution = 0.2)
+
+DimPlot(fibros_integrated, group.by = c("run", "tissue", "timepoint", "seurat_clusters", "cell_subtype"))
+
+saveRDS(fibros_integrated, here("results/rds/fibros_integrated.rds"))
+
+# ── 5. Post-integration markers & refined subtype annotation based on Pietilä and others ──────────────────
+fibros_integrated <- JoinLayers(fibros_integrated)
+
+Idents(fibros_integrated) <- "cell_subtype"
+
+fibro_markers_int <- FindAllMarkers(
+  fibros_integrated,
+  only.pos       = TRUE,
+  min.pct        = 0.25,
+  logfc.threshold = 0.5
+)
+
+fibro_markers_sub_int <- fibro_markers_int %>%
+  filter(p_val_adj < 0.01) %>%
+  group_by(cluster) %>%
+  slice_head(n = 50) %>%
+  ungroup()
+
+write_tsv(fibro_markers_sub_int, file.path(TABLES_DIR, "fibro_post_integration_markers_top50.tsv"))
+
+# Refined manual annotation after integration
+fibros_integrated <- fibros_integrated %>%
+  mutate_meta(
+    cell_subtype = case_when(
+      cell_subtype %in% "pvFB2"         ~ "pvFB2",
+      cell_subtype %in% "duFB2"         ~ "duFB2",
+      cell_subtype %in% "arachnoidFB"   ~ "arachnoidFB",
+      cell_subtype %in% "duFB1"         ~ "duFB1",
+      cell_subtype %in% "pvFB1"         ~ "pvFB1",
+      cell_subtype %in% "duFB3"         ~ "duFB3",
+      cell_subtype %in% "periostalFB1"  ~ "periostalFB1",
+      cell_subtype %in% "myo_duFB"      ~ "myo_duFB",
+      cell_subtype %in% "duFB4"         ~ "duFB4",
+      cell_subtype %in% "duFB5"         ~ "duFB5",
+      cell_subtype %in% "pialFB"        ~ "pialFB",
+      cell_subtype %in% "lmFB"          ~ "duFB6",
+      cell_subtype %in% "pvFB3"         ~ "pvFB3",
+      cell_subtype %in% "periostalFB2"  ~ "periostalFB2",
+      TRUE                              ~ cell_subtype
+    )
+  )
+
+DimPlot(fibros_integrated, group.by = "cell_subtype", label = TRUE, repel = TRUE) +
+  ggtitle("Fibro subtypes post-Harmony integration")
+
+# ── 6. Custom color palettes ─────────────────────────────────────────────────
+pal_annotation <- createPalette(
+  length(unique(fibros_integrated$annotation)),
+  seedcolors = c("#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377", "#BBBBBB")
+)
+names(pal_annotation) <- sort(unique(fibros_integrated$annotation))
+
+set.seed(10)
+pal_subtype <- createPalette(
+  length(unique(fibros_integrated$cell_subtype)),
+  seedcolors = c("#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377", "#BBBBBB")
+)
+names(pal_subtype) <- sort(unique(fibros_integrated$cell_subtype))
+
+pal_tissue <- createPalette(3, seedcolors = c("#4477AA", "#228833", "#EE6677"))
+names(pal_tissue) <- c("Dura", "Lm", "Ctx")
+
+pal_timepoint <- createPalette(3, seedcolors = c("#F39C12", "#8E44AD", "#2ECC71"))
+names(pal_timepoint) <- c("d5", "8w", "CTL")
+
+pal_phase <- c(G1 = "#228833", S = "#66CCEE", G2M = "#AA3377")
+
+# UMAP overview
+DimPlot(fibros_integrated, group.by = "annotation", cols = pal_annotation) + NoAxes()
+DimPlot(fibros_integrated, group.by = "cell_subtype", cols = pal_subtype, pt.size = 1.5) + NoAxes()
+DimPlot(fibros_integrated, group.by = "tissue", cols = pal_tissue, pt.size = 1.5) + NoAxes()
+DimPlot(fibros_integrated, group.by = "timepoint", cols = pal_timepoint, pt.size = 1.5) + NoAxes()
+DimPlot(fibros_integrated, group.by = "Phase", cols = pal_phase, pt.size = 1.5) + NoAxes()
+
+# ── 7. Propeller differential abundance testing ──────────────────────────────
+# Prepare data (exclude non sorted cell types per run)
+exclude_run2 <- c("araFB", "duFB1", "duFB2", "periostalFB")
+exclude_run1 <- c()
+
+cell_info <- fibros_integrated@meta.data %>%
+  mutate(
+    barcode  = rownames(.),
+    clusters = cell_subtype,
+    samples  = sample,
+    group    = factor(timepoint, levels = c("CTL", "d5", "8w"))
+  ) %>%
+  filter(!is.na(clusters))
+
+cell_info_run1 <- cell_info %>% filter(grepl("^1_", samples) & !clusters %in% exclude_run1)
+cell_info_run2 <- cell_info %>% filter(grepl("^2_", samples) & !clusters %in% exclude_run2)
+
+# Propeller – Run 1
+prop_run1 <- propeller(
+  clusters = cell_info_run1$clusters,
+  sample   = cell_info_run1$samples,
+  group    = cell_info_run1$group
+)
+prop_run1$Run <- "Run1"
+
+# Propeller – Run 2
+prop_run2 <- propeller(
+  clusters = cell_info_run2$clusters,
+  sample   = cell_info_run2$samples,
+  group    = cell_info_run2$group
+)
+prop_run2$Run <- "Run2"
+
+prop_results_fibros <- bind_rows(prop_run1, prop_run2)
+
+write_tsv(prop_results_fibros, file.path(TABLES_DIR, "propeller_fibros_by_run.tsv"))
+print(prop_results_fibros)
+
+# ── 8. Tissue-stratified DE + volcano plots ─────────────────────────────────
+fibros_ctx_lm <- subset(fibros_integrated, tissue %in% c("Ctx", "Lm"))
+fibros_dura   <- subset(fibros_integrated, tissue == "Dura")
+
+Idents(fibros_ctx_lm) <- "timepoint"
+fibros_ctx_lm <- JoinLayers(fibros_ctx_lm)
+
+Idents(fibros_dura) <- "timepoint"
+fibros_dura <- JoinLayers(fibros_dura)
+
+comparisons <- list(
+  list(name = "d5_vs_CTL", ident1 = "d5",  ident2 = "CTL"),
+  list(name = "8w_vs_d5",  ident1 = "8w",  ident2 = "d5"),
+  list(name = "8w_vs_CTL", ident1 = "8w",  ident2 = "CTL")
+)
+
+de_results_fibro <- list()
+
+for (comp in comparisons) {
+  de_ctx_lm <- FindMarkers(
+    fibros_ctx_lm, ident.1 = comp$ident1, ident.2 = comp$ident2,
+    logfc.threshold = 0, min.pct = 0.01, test.use = "wilcox", only.pos = FALSE
+  )
+  de_ctx_lm$gene <- rownames(de_ctx_lm)
+  de_results_fibro[[paste0("ctx_lm_", comp$name)]] <- de_ctx_lm
+  
+  de_dura <- FindMarkers(
+    fibros_dura, ident.1 = comp$ident1, ident.2 = comp$ident2,
+    logfc.threshold = 0, min.pct = 0.01, test.use = "wilcox", only.pos = FALSE
+  )
+  de_dura$gene <- rownames(de_dura)
+  de_results_fibro[[paste0("dura_", comp$name)]] <- de_dura
+}
+
+iwalk(de_results_fibro, ~ write_tsv(.x, file.path(TABLES_DIR, paste0("DE_fibro_", .y, ".tsv"))))
+
+# Volcano plots
+pdf(file.path(FIGURES_DIR, "fibros_volcano_plots.pdf"), width = 7, height = 6)
+
+EnhancedVolcano(
+  de_results_fibro$ctx_lm_d5_vs_CTL,
+  lab = de_results_fibro$ctx_lm_d5_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm Fibro: d5 vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_fibro$ctx_lm_8w_vs_d5,
+  lab = de_results_fibro$ctx_lm_8w_vs_d5$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm Fibro: 8w vs d5",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_fibro$ctx_lm_8w_vs_CTL,
+  lab = de_results_fibro$ctx_lm_8w_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Ctx/Lm Fibro: 8w vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_fibro$dura_d5_vs_CTL,
+  lab = de_results_fibro$dura_d5_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura Fibro: d5 vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_fibro$dura_8w_vs_d5,
+  lab = de_results_fibro$dura_8w_vs_d5$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura Fibro: 8w vs d5",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+EnhancedVolcano(
+  de_results_fibro$dura_8w_vs_CTL,
+  lab = de_results_fibro$dura_8w_vs_CTL$gene,
+  x = "avg_log2FC", y = "p_val_adj",
+  title = "Dura Fibro: 8w vs CTL",
+  pCutoff = 0.05, FCcutoff = 0.25
+)
+
+dev.off()
+
+sessionInfo()
