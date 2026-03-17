@@ -1,0 +1,550 @@
+# =============================================================================
+# Project:   Bulk RNA-seq – LPS treatment in WT + Ccr2-KO model
+# Script:    bulkRNAseq_LPS_WT_KO_analysis.R
+# Author:    MAximilian Fliegauf
+# Date:      11/2024
+# Purpose:   Load WT + KO counts & metadata → QC → gene filtering (ribosomal/mito/
+#            pseudo/patterns) → batch correction (ComBat-seq) → DESeq2 analysis
+#            (full dataset + LPS vs CTL contrasts) → volcano plots → bar plots of
+#            DEGs (WT vs KO).
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(writexl)
+  library(dplyr)
+  library(tidyr)
+  library(tidyheatmaps)
+  library(tibble)
+  library(ggrepel)
+  library(apeglm)
+  library(gridExtra)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(plotly)
+  library(AnnotationDbi)
+  library(msigdbr)
+  library(readxl)
+  library(openxlsx)
+  library(EnhancedVolcano)
+  library(RColorBrewer)
+  library(biomaRt)
+  library(VennDiagram)
+  library(sva)           # ComBat_seq
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/bulkRNAseq_LPS_WT_KO_analysis.R")
+
+COUNTS_KO_FILE   <- here("data/raw/counts_Ccr2KO.txt")
+COL_DATA_KO_FILE <- here("data/raw/colData_Ccr2KO.txt")
+COUNTS_WT_FILE   <- here("data/raw/counts_LPS_yo.txt")
+COL_DATA_WT_FILE <- here("data/raw/colData_LPS_yo.txt")
+
+TABLES_DIR  <- here("results/tables/bulkRNAseq_WT_KO")
+FIGURES_DIR <- here("results/figures/bulkRNAseq_WT_KO")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load WT + KO counts & metadata ────────────────────────────────────────
+count_data_KO <- read.table(COUNTS_KO_FILE, header = TRUE, row.names = 1, sep = "\t")
+colData_KO    <- read.table(COL_DATA_KO_FILE, header = TRUE, sep = "\t")
+
+count_data_yo <- read.table(COUNTS_WT_FILE, header = TRUE, row.names = 1, sep = "\t")
+colData_yo    <- read.table(COL_DATA_WT_FILE, header = TRUE, sep = "\t")
+
+# Assign genotype
+colData_KO$genotype <- "KO"
+colData_yo$genotype <- "WT"
+
+# Match column names
+colnames(count_data_KO) <- colData_KO$Sample
+colnames(count_data_yo) <- colData_yo$Sample
+
+# ── 2. Combine colData & create combined factors ──────────────────────────────
+# Add missing columns to colData_KO
+missing_cols <- setdiff(colnames(colData_yo), colnames(colData_KO))
+for (col in missing_cols) {
+  colData_KO[[col]] <- NA
+}
+
+# Reorder columns to match
+colData_KO <- colData_KO[, colnames(colData_yo)]
+
+# rbind
+colData_combined <- rbind(colData_yo, colData_KO)
+
+# Create combined factors
+colData_combined <- colData_combined %>%
+  mutate(
+    combined = paste0(combined, "_", genotype),
+    grou     = paste(Treatment, Condition, sep = "_")
+  )
+
+colData_combined$grou <- factor(colData_combined$grou)
+
+# ── 3. Combine count data ────────────────────────────────────────────────────
+count_data_combined <- merge(
+  count_data_KO, count_data_yo,
+  by = "row.names", all = TRUE
+)
+
+rownames(count_data_combined) <- count_data_combined$Row.names
+count_data_combined <- count_data_combined[, -1]
+count_data_combined[is.na(count_data_combined)] <- 0
+
+# ── 5. Quality Control ───────────────────────────────────────────────────────
+total_counts <- colSums(count_data_combined)
+summary(total_counts)
+
+pdf(file.path(FIGURES_DIR, "library_sizes_WT_KO.pdf"), width = 10, height = 6)
+barplot(total_counts, main = "Library Sizes WT and KO", col = "lightblue", las = 2)
+dev.off()
+
+# ── 6. General filtering & batch correction ──────────────────────────────────
+# Basic filter: ≥10 counts in ≥ half of samples
+count_filtered_comb <- count_data_combined[rowSums(count_data_combined > 10) >= ncol(count_data_combined)/2, ]
+
+# Batch column
+colData_combined$batch <- ifelse(
+  colData_combined$Sample %in% c("1_CAM", "4_CAM", "6_CAM", "9_CAM", "12_CAM", "14_CAM"),
+  "Batch1", "Batch2"
+)
+
+# Model matrix for known covariates
+mod <- model.matrix(~ genotype + cell_type, data = colData_combined)
+
+# ComBat-seq batch correction
+count_data_cor <- ComBat_seq(
+  counts     = as.matrix(count_filtered_comb),
+  batch      = colData_combined$batch,
+  group      = colData_combined$grou,
+  covar_mod  = mod
+)
+
+# ── 7. Gene filtering (ribosomal, mitochondrial, pseudogenes, patterns) ───────
+ribo_genes <- msigdbr(species = "Mus musculus", category = "C2") %>%
+  filter(gs_name == "KEGG_RIBOSOME") %>% pull(gene_symbol)
+
+mito_genes <- msigdbr(species = "Mus musculus", category = "C2") %>%
+  filter(gs_name == "KEGG_OXIDATIVE_PHOSPHORYLATION") %>% pull(gene_symbol)
+
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl", host = "https://www.ensembl.org")
+
+pseudo_genes <- getBM(attributes = c("external_gene_name"),
+                      filters = "biotype",
+                      values = c("pseudogene", "predicted", "novel", "uncharacterized"),
+                      mart = mart) %>% pull(external_gene_name)
+
+noncoding_genes <- getBM(attributes = c("external_gene_name"),
+                         filters = "biotype",
+                         values = c("lincRNA", "miRNA", "snRNA", "snoRNA"),
+                         mart = mart) %>% pull(external_gene_name)
+
+patterns <- c("Mrp", "Rpl", "Rps", "Sn", "Sf", "Gtf", "Med", "Rbm", "Rik",
+              "Lsm", "Eif", "Atp", "Nduf", "Tomm", "Pol", "Rna", "Gm", "Ddx",
+              "Smim", "Zfp", "Dna", "Timm")
+
+pattern_genes <- grep(paste(patterns, collapse = "|"), rownames(count_data_cor), value = TRUE)
+
+ex_genes <- unique(c(ribo_genes, mito_genes, pseudo_genes, noncoding_genes, pattern_genes))
+
+count_filtered_comb <- count_data_cor[!rownames(count_data_cor) %in% ex_genes, ]
+
+cat("Genes excluded:", length(ex_genes), "\n")
+cat("Remaining genes:", nrow(count_filtered_comb), "\n")
+
+# ── 8. DESeq2 – Full dataset ─────────────────────────────────────────────────
+design_formula <- ~ grou + genotype + cell_type
+
+dds <- DESeqDataSetFromMatrix(
+  countData = count_filtered_comb,
+  colData   = colData_combined,
+  design    = design_formula
+)
+
+dds <- estimateSizeFactors(dds)
+dds <- DESeq(dds)
+
+# VST for visualization
+vsd <- vst(dds, blind = FALSE)
+
+# ── 9. PCA & unbiased heatmap ────────────────────────────────────────────────
+pca_data <- plotPCA(vsd, intgroup = c("grou", "cell_type", "genotype"), returnData = TRUE, ntop = 150)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+p_pca <- ggplot(pca_data, aes(PC1, PC2, color = genotype, shape = cell_type, fill = grou)) +
+  geom_point(size = 3, stroke = 1) +
+  xlab(paste0("PC1: ", percent_var[1], "% variance")) +
+  ylab(paste0("PC2: ", percent_var[2], "% variance")) +
+  labs(title = "PCA of RNA-seq Data (WT + KO)") +
+  scale_shape_manual(values = c(21, 22, 24)) +
+  scale_color_manual(values = c("black", "grey")) +
+  scale_fill_manual(values = brewer.pal(n = length(unique(pca_data$grou)), name = "Set2")) +
+  guides(fill = guide_legend(override.aes = list(shape = 21))) +
+  guides(shape = guide_legend(override.aes = list(shape = c(16, 15)))) +
+  theme_minimal()
+
+ggsave(file.path(FIGURES_DIR, "pca_WT_KO.pdf"), p_pca, width = 8, height = 6)
+
+# Heatmap – top 250 variable genes
+vsd_mat <- assay(vsd)
+gene_variances <- apply(vsd_mat, 1, var)
+top_genes <- order(gene_variances, decreasing = TRUE)[1:250]
+vsd_top <- vsd_mat[top_genes, ]
+
+annotation_col <- as.data.frame(colData_combined[, c("grou", "genotype", "cell_type"), drop = FALSE])
+rownames(annotation_col) <- colData_combined$Sample
+
+pheatmap(
+  vsd_top,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  fontsize = 5,
+  fontsize_row = 3,
+  fontsize_col = 8,
+  cellwidth = 10,
+  annotation_col = annotation_col,
+  filename = file.path(FIGURES_DIR, "heatmap_top250_variable_genes.pdf")
+)
+
+# ── 10. DESeq2 contrasts – LPS vs CTL (CAM_B vs CAM_V, MG_B vs MG_V) ──────────
+design_v <- ~ combined
+dds_v <- DESeqDataSetFromMatrix(
+  countData = count_filtered_comb,
+  colData   = colData_combined,
+  design    = design_v
+)
+
+dds_v <- estimateSizeFactors(dds_v)
+dds_v <- DESeq(dds_v)
+
+# WT – CAM_B vs CAM_V
+dds_v$combined <- relevel(dds_v$combined, ref = "CAM_young_V_LPS_WT")
+dds_v <- nbinomWaldTest(dds_v)
+res <- results(dds_v, name = "combined_CAM_young_BLZ_LPS_WT_vs_CAM_young_V_LPS_WT")
+lfc_BvV_WT <- lfcShrink(dds_v, coef = "combined_CAM_young_BLZ_LPS_WT_vs_CAM_young_V_LPS_WT", type = "apeglm")
+lfc_BvV_WT$padj <- res$padj
+
+p_volc_BvV_WT <- EnhancedVolcano(
+  lfc_BvV_WT,
+  lab = rownames(lfc_BvV_WT),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "CAM_B vs CAM_V WT young",
+  max.overlaps = Inf, labSize = 2, pointSize = 2, ylim = c(0, 7.5)
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_B_vs_V_WT.pdf"), p_volc_BvV_WT, width = 8, height = 6)
+
+WT_bar <- length(rownames(lfc_BvV_WT[abs(lfc_BvV_WT$log2FoldChange) > 1 & lfc_BvV_WT$padj < 0.05, ]))
+
+# WT – MG_B vs MG_V
+dds_v$combined <- relevel(dds_v$combined, ref = "MG_young_V_LPS_WT")
+dds_v <- nbinomWaldTest(dds_v)
+res <- results(dds_v, name = "combined_MG_young_BLZ_LPS_WT_vs_MG_young_V_LPS_WT")
+lfc_BvV_WT_MG <- lfcShrink(dds_v, coef = "combined_MG_young_BLZ_LPS_WT_vs_MG_young_V_LPS_WT", type = "apeglm")
+lfc_BvV_WT_MG$padj <- res$padj
+
+p_volc_BvV_WT_MG <- EnhancedVolcano(
+  lfc_BvV_WT_MG,
+  lab = rownames(lfc_BvV_WT_MG),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "MG_B vs MG_V WT young",
+  max.overlaps = 25, ylim = c(0, 7.5)
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_MG_B_vs_V_WT.pdf"), p_volc_BvV_WT_MG, width = 8, height = 6)
+
+WT_bar_MG <- length(rownames(lfc_BvV_WT_MG[abs(lfc_BvV_WT_MG$log2FoldChange) > 1 & lfc_BvV_WT_MG$padj < 0.05, ]))
+
+# KO – CAM_B vs CAM_V
+dds_v$combined <- relevel(dds_v$combined, ref = "CAM_young_V_LPS_KO")
+dds_v <- nbinomWaldTest(dds_v)
+res <- results(dds_v, name = "combined_CAM_young_BLZ_LPS_KO_vs_CAM_young_V_LPS_KO")
+lfc_BvV_KO <- lfcShrink(dds_v, coef = "combined_CAM_young_BLZ_LPS_KO_vs_CAM_young_V_LPS_KO", type = "apeglm")
+lfc_BvV_KO$padj <- res$padj
+
+p_volc_BvV_KO <- EnhancedVolcano(
+  lfc_BvV_KO,
+  lab = rownames(lfc_BvV_KO),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "CAM_B vs CAM_V KO young",
+  max.overlaps = 25, ylim = c(0, 7.5)
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_B_vs_V_KO.pdf"), p_volc_BvV_KO, width = 8, height = 6)
+
+KO_bar <- length(rownames(lfc_BvV_KO[abs(lfc_BvV_KO$log2FoldChange) > 1 & lfc_BvV_KO$padj < 0.05, ]))
+
+# KO – MG_B vs MG_V
+dds_v$combined <- relevel(dds_v$combined, ref = "MG_young_V_LPS_KO")
+dds_v <- nbinomWaldTest(dds_v)
+res <- results(dds_v, name = "combined_MG_young_BLZ_LPS_KO_vs_MG_young_V_LPS_KO")
+lfc_BvV_KO_MG <- lfcShrink(dds_v, coef = "combined_MG_young_BLZ_LPS_KO_vs_MG_young_V_LPS_KO", type = "apeglm")
+lfc_BvV_KO_MG$padj <- res$padj
+
+p_volc_BvV_KO_MG <- EnhancedVolcano(
+  lfc_BvV_KO_MG,
+  lab = rownames(lfc_BvV_KO_MG),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "MG_B vs MG_V KO young",
+  max.overlaps = 25, ylim = c(0, 7.5)
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_MG_B_vs_V_KO.pdf"), p_volc_BvV_KO_MG, width = 8, height = 6)
+
+KO_bar_MG <- length(rownames(lfc_BvV_KO_MG[abs(lfc_BvV_KO_MG$log2FoldChange) > 1 & lfc_BvV_KO_MG$padj < 0.05, ]))
+
+# ── 11. Bar plots – DEG counts (WT vs KO) ─────────────────────────────────────
+# CAMs
+deg_counts_CAM <- c(WT_bar, KO_bar)
+names(deg_counts_CAM) <- c("WT_DEGs", "KO_DEGs")
+
+pdf(file.path(FIGURES_DIR, "bar_DEGs_CAM_WT_vs_KO.pdf"), width = 6, height = 6)
+barplot(
+  deg_counts_CAM,
+  col = c("firebrick", "steelblue"),
+  main = "Differentially Expressed Genes (CAMs)",
+  ylab = "Number of Genes",
+  ylim = c(0, max(deg_counts_CAM) + 20),
+  cex.names = 1.2,
+  cex.lab = 1.2,
+  las = 1
+)
+text(x = c(0.7, 1.9), y = deg_counts_CAM + 5, labels = deg_counts_CAM, cex = 1.2, col = "black")
+dev.off()
+
+# MG
+deg_counts_MG <- c(WT_bar_MG, KO_bar_MG)
+names(deg_counts_MG) <- c("WT_DEGs", "KO_DEGs")
+
+pdf(file.path(FIGURES_DIR, "bar_DEGs_MG_WT_vs_KO.pdf"), width = 6, height = 6)
+barplot(
+  deg_counts_MG,
+  col = c("firebrick", "steelblue"),
+  main = "Differentially Expressed Genes (MG)",
+  ylab = "Number of Genes",
+  ylim = c(0, max(deg_counts_MG) + 20),
+  cex.names = 1.2,
+  cex.lab = 1.2,
+  las = 1
+)
+text(x = c(0.7, 1.9), y = deg_counts_MG + 5, labels = deg_counts_MG, cex = 1.2, col = "black")
+dev.off()
+
+# Chi-square test – CAMs
+observed_CAM <- matrix(c(150, 9138, 29, 9259), nrow = 2, byrow = TRUE,
+                       dimnames = list(c("WT", "KO"), c("DEGs", "Not_DEGs")))
+chi_CAM <- chisq.test(observed_CAM)
+cat("CAMs Chi-square statistic:", chi_CAM$statistic, "\n")
+cat("CAMs Degrees of freedom:", chi_CAM$parameter, "\n")
+cat("CAMs P-value:", chi_CAM$p.value, "\n")
+
+# Chi-square test – MG
+observed_MG <- matrix(c(2, 9286, 0, 9288), nrow = 2, byrow = TRUE,
+                      dimnames = list(c("WT", "KO"), c("DEGs", "Not_DEGs")))
+chi_MG <- chisq.test(observed_MG)
+cat("MG Chi-square statistic:", chi_MG$statistic, "\n")
+cat("MG Degrees of freedom:", chi_MG$parameter, "\n")
+cat("MG P-value:", chi_MG$p.value, "\n")
+
+# ── 12. LPS vs CTL contrasts (CAM_B vs CTL, CAM_V vs CTL, MG_B vs CTL, MG_V vs CTL) ─
+dds_v$combined <- relevel(dds_v$combined, ref = "CAM_young_CTL_CTL_WT")
+dds_v <- nbinomWaldTest(dds_v)
+
+res_CAM_B_LPS_vs_CTL <- results(dds_v, name = "combined_CAM_young_BLZ_LPS_WT_vs_CAM_young_CTL_CTL_WT")
+lfc_CAM_B_LPS_vs_CTL <- lfcShrink(dds_v, coef = "combined_CAM_young_BLZ_LPS_WT_vs_CAM_young_CTL_CTL_WT", type = "apeglm")
+lfc_CAM_B_LPS_vs_CTL$padj <- res_CAM_B_LPS_vs_CTL$padj
+
+p_volc_CAM_B_LPS_vs_CTL <- EnhancedVolcano(
+  lfc_CAM_B_LPS_vs_CTL,
+  lab = rownames(lfc_CAM_B_LPS_vs_CTL),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "CAMs BLZ LPS vs CTL (WT)",
+  max.overlaps = 100, labSize = 2
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_B_LPS_vs_CTL_WT.pdf"), p_volc_CAM_B_LPS_vs_CTL, width = 8, height = 6)
+
+CAM_sign_B_lfc0 <- rownames(lfc_CAM_B_LPS_vs_CTL[lfc_CAM_B_LPS_vs_CTL$log2FoldChange > 0 & lfc_CAM_B_LPS_vs_CTL$padj < 0.05, ])
+
+# CAM_V LPS vs CTL
+dds_v$combined <- relevel(dds_v$combined, ref = "CAM_young_CTL_CTL_WT")
+dds_v <- nbinomWaldTest(dds_v)
+
+res_CAM_V_LPS_vs_CTL <- results(dds_v, name = "combined_CAM_young_V_LPS_WT_vs_CAM_young_CTL_CTL_WT")
+lfc_CAM_V_LPS_vs_CTL <- lfcShrink(dds_v, coef = "combined_CAM_young_V_LPS_WT_vs_CAM_young_CTL_CTL_WT", type = "apeglm")
+lfc_CAM_V_LPS_vs_CTL$padj <- res_CAM_V_LPS_vs_CTL$padj
+
+p_volc_CAM_V_LPS_vs_CTL <- EnhancedVolcano(
+  lfc_CAM_V_LPS_vs_CTL,
+  lab = rownames(lfc_CAM_V_LPS_vs_CTL),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "CAMs Vehicle LPS vs CTL (WT)",
+  max.overlaps = 100, labSize = 2
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_V_LPS_vs_CTL_WT.pdf"), p_volc_CAM_V_LPS_vs_CTL, width = 8, height = 6)
+
+CAM_sign_V_lfc0 <- rownames(lfc_CAM_V_LPS_vs_CTL[lfc_CAM_V_LPS_vs_CTL$log2FoldChange > 0 & lfc_CAM_V_LPS_vs_CTL$padj < 0.05, ])
+
+# MG BLZ LPS vs CTL (WT)
+dds_v$combined <- relevel(dds_v$combined, ref = "MG_young_CTL_CTL_WT")
+dds_v <- nbinomWaldTest(dds_v)
+
+res_MG_B_LPS_vs_CTL <- results(dds_v, name = "combined_MG_young_BLZ_LPS_WT_vs_MG_young_CTL_CTL_WT")
+lfc_MG_B_LPS_vs_CTL <- lfcShrink(dds_v, coef = "combined_MG_young_BLZ_LPS_WT_vs_MG_young_CTL_CTL_WT", type = "apeglm")
+lfc_MG_B_LPS_vs_CTL$padj <- res_MG_B_LPS_vs_CTL$padj
+
+p_volc_MG_B_LPS_vs_CTL <- EnhancedVolcano(
+  lfc_MG_B_LPS_vs_CTL,
+  lab = rownames(lfc_MG_B_LPS_vs_CTL),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "MG BLZ LPS vs MG young CTL (WT)",
+  max.overlaps = 25
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_MG_B_LPS_vs_CTL_WT.pdf"), p_volc_MG_B_LPS_vs_CTL, width = 8, height = 6)
+
+# MG V LPS vs CTL (WT)
+dds_v$combined <- relevel(dds_v$combined, ref = "MG_young_CTL_CTL_WT")
+dds_v <- nbinomWaldTest(dds_v)
+
+res_MG_V_LPS_vs_CTL <- results(dds_v, name = "combined_MG_young_V_LPS_WT_vs_MG_young_CTL_CTL_WT")
+lfc_MG_V_LPS_vs_CTL <- lfcShrink(dds_v, coef = "combined_MG_young_V_LPS_WT_vs_MG_young_CTL_CTL_WT", type = "apeglm")
+lfc_MG_V_LPS_vs_CTL$padj <- res_MG_V_LPS_vs_CTL$padj
+
+p_volc_MG_V_LPS_vs_CTL <- EnhancedVolcano(
+  lfc_MG_V_LPS_vs_CTL,
+  lab = rownames(lfc_MG_V_LPS_vs_CTL),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "MG V LPS vs MG young CTL (WT)",
+  max.overlaps = 25
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_MG_V_LPS_vs_CTL_WT.pdf"), p_volc_MG_V_LPS_vs_CTL, width = 8, height = 6)
+
+# ── 13. LPS vs CTL contrasts in KO ────────────────────────────────────────────
+dds_v$combined <- relevel(dds_v$combined, ref = "CAM_young_CTL_CTL_KO")
+dds_v <- nbinomWaldTest(dds_v)
+
+res_CAM_B_LPS_vs_CTL_KO <- results(dds_v, name = "combined_CAM_young_BLZ_LPS_KO_vs_CAM_young_CTL_CTL_KO")
+lfc_CAM_B_LPS_vs_CTL_KO <- lfcShrink(dds_v, coef = "combined_CAM_young_BLZ_LPS_KO_vs_CAM_young_CTL_CTL_KO", type = "apeglm")
+lfc_CAM_B_LPS_vs_CTL_KO$padj <- res_CAM_B_LPS_vs_CTL_KO$padj
+
+p_volc_CAM_B_LPS_vs_CTL_KO <- EnhancedVolcano(
+  lfc_CAM_B_LPS_vs_CTL_KO,
+  lab = rownames(lfc_CAM_B_LPS_vs_CTL_KO),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "CAMs BLZ LPS vs CTL (KO)",
+  max.overlaps = 100, labSize = 2
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_B_LPS_vs_CTL_KO.pdf"), p_volc_CAM_B_LPS_vs_CTL_KO, width = 8, height = 6)
+
+dds_v$combined <- relevel(dds_v$combined, ref = "CAM_young_CTL_CTL_KO")
+dds_v <- nbinomWaldTest(dds_v)
+
+res_CAM_V_LPS_vs_CTL_KO <- results(dds_v, name = "combined_CAM_young_V_LPS_KO_vs_CAM_young_CTL_CTL_KO")
+lfc_CAM_V_LPS_vs_CTL_KO <- lfcShrink(dds_v, coef = "combined_CAM_young_V_LPS_KO_vs_CAM_young_CTL_CTL_KO", type = "apeglm")
+lfc_CAM_V_LPS_vs_CTL_KO$padj <- res_CAM_V_LPS_vs_CTL_KO$padj
+
+p_volc_CAM_V_LPS_vs_CTL_KO <- EnhancedVolcano(
+  lfc_CAM_V_LPS_vs_CTL_KO,
+  lab = rownames(lfc_CAM_V_LPS_vs_CTL_KO),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "CAMs Vehicle LPS vs CTL (KO)",
+  max.overlaps = 100, labSize = 2
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_V_LPS_vs_CTL_KO.pdf"), p_volc_CAM_V_LPS_vs_CTL_KO, width = 8, height = 6)
+
+dds_v$combined <- relevel(dds_v$combined, ref = "MG_young_CTL_CTL_KO")
+dds_v <- nbinomWaldTest(dds_v)
+
+res_MG_B_LPS_vs_CTL_KO <- results(dds_v, name = "combined_MG_young_BLZ_LPS_KO_vs_MG_young_CTL_CTL_KO")
+lfc_MG_B_LPS_vs_CTL_KO <- lfcShrink(dds_v, coef = "combined_MG_young_BLZ_LPS_KO_vs_MG_young_CTL_CTL_KO", type = "apeglm")
+lfc_MG_B_LPS_vs_CTL_KO$padj <- res_MG_B_LPS_vs_CTL_KO$padj
+
+p_volc_MG_B_LPS_vs_CTL_KO <- EnhancedVolcano(
+  lfc_MG_B_LPS_vs_CTL_KO,
+  lab = rownames(lfc_MG_B_LPS_vs_CTL_KO),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "MG BLZ LPS vs MG young CTL (KO)",
+  max.overlaps = 25
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_MG_B_LPS_vs_CTL_KO.pdf"), p_volc_MG_B_LPS_vs_CTL_KO, width = 8, height = 6)
+
+dds_v$combined <- relevel(dds_v$combined, ref = "MG_young_CTL_CTL_KO")
+dds_v <- nbinomWaldTest(dds_v)
+
+res_MG_V_LPS_vs_CTL_KO <- results(dds_v, name = "combined_MG_young_V_LPS_KO_vs_MG_young_CTL_CTL_KO")
+lfc_MG_V_LPS_vs_CTL_KO <- lfcShrink(dds_v, coef = "combined_MG_young_V_LPS_KO_vs_MG_young_CTL_CTL_KO", type = "apeglm")
+lfc_MG_V_LPS_vs_CTL_KO$padj <- res_MG_V_LPS_vs_CTL_KO$padj
+
+p_volc_MG_V_LPS_vs_CTL_KO <- EnhancedVolcano(
+  lfc_MG_V_LPS_vs_CTL_KO,
+  lab = rownames(lfc_MG_V_LPS_vs_CTL_KO),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "MG V LPS vs MG young CTL (KO)",
+  max.overlaps = 25
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_MG_V_LPS_vs_CTL_KO.pdf"), p_volc_MG_V_LPS_vs_CTL_KO, width = 8, height = 6)
+
+# ── 14. Common LPS response radar plot ────────────────────────────────────────
+LPS_genes <- c(
+  "Tnf", "Il1a", "Il1b", "Spp1", "Tnfaip3", "Nfkbiz", "Hdac4", "Gadd45b", "Il6",
+  "Ccl3", "Ccl9", "Fkbp5", "Fpr1", "Id2",
+  "Il15ra", "Il1rn", "Itga5", "C3", "Itgal",
+  "Mmp19", "Msrb1", "Ms4a6d", "Nfkbia", "Ikbke", "Mmp14",
+  "Lcn2", "Ccl5", "Cxcl13", "Mt1", "Saa3",
+  "Hacd4", "Il16", "Trem2", "Tgfbr2", "Slc9a9", "Tln2",
+  "Mgl2", "Gas6", "Csf1r"
+)
+
+sel_counts <- counts(dds_v, normalized = TRUE)[LPS_genes[LPS_genes %in% rownames(counts(dds_v))], , drop = FALSE]
+
+mean_expression <- sapply(unique(colData_combined$combined), function(cond) {
+  samples <- colData_combined$Sample[colData_combined$combined == cond]
+  rowMeans(sel_counts[, samples, drop = FALSE])
+})
+
+mean_df <- as.data.frame(t(mean_expression))
+mean_df$Group <- rownames(mean_df)
+
+ggradar_data <- mean_df %>%
+  mutate(across(-Group, ~ log10(. + 1))) %>%
+  rename(group = Group)
+
+ggradar(
+  ggradar_data,
+  values.radar = c(0, 3, 7),
+  group.point.size = 2,
+  grid.mid = 3,
+  grid.max = 7,
+  group.line.width = 1,
+  legend.text.size = 10
+)
+
+ggsave(file.path(FIGURES_DIR, "radar_common_LPS_response.pdf"), width = 10, height = 8)
+
+sessionInfo()
