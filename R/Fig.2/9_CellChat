@@ -1,1 +1,253 @@
+# =============================================================================
+# Project:   scRNA-seq – Niche CellChat analysis in WT animals
+# Script:    scRNAseq_CellChat_Niche_Revision_WT.R
+# Author:    Maximilian Fliegauf
+# Date:      10/2025
+# Purpose:   Load full integrated Seurat object → subset Ctx/Lm tissues →
+#            split by timepoint → process each (Harmony only for Ctx/Lm) →
+#            create CellChat objects → merge → differential interaction analysis →
+#            lift to common labels → visualize top interactions (chord plots).
+#
+# This documentation shows how the CellChat Objects were prepared
+#
+# =============================================================================
 
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(CellChat)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(patchwork)
+  library(forcats)
+  library(tidyverse)
+  library(Polychrome)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/scRNAseq_CellChat_Niche_Revision_WT.R")
+
+INPUT_RDS     <- here("results/objects/full_dataset_final_after_integration_and_final_annotation.rds")
+OUTPUT_DIR    <- here("results/objects/cellchat")
+FIGURES_DIR   <- here("results/figures/cellchat")
+
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Ctx/Lm cell types (as original)
+lm_ctx_cell_types <- c(
+  "arterialEC", "arterialVSMC", "capillaryEC1", "capillaryEC2", "clMonocyte",
+  "diffMac", "dividingMac1", "dividingMac2", "homMG", "iegEC", "Lyve1_CAM",
+  "MHCII_CAM", "ncMonocyte", "PC", "pialFB", "pvFB1", "pvFB2", "repopMG1",
+  "repopMG2", "venousEC", "venousVSMC"
+)
+
+# ── 1. Load full annotated dataset ───────────────────────────────────────────
+full <- readRDS(INPUT_RDS)
+cat("Loaded full dataset:", dim(full), "\n")
+
+# ── 2. Define processing function ────────────────────────────────────────────
+process_seurat_cellchat <- function(seurat_obj, cell_types, tissue_name, timepoint) {
+  # Start timing
+  ptm <- Sys.time()
+  
+  # Seurat preprocessing
+  seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 5000)
+  seurat_obj <- ScaleData(seurat_obj)
+  seurat_obj <- RunPCA(seurat_obj)
+  
+  pdf(file.path(FIGURES_DIR, paste0(tissue_name, "_", timepoint, "_elbow.pdf")), width = 6, height = 4)
+  ElbowPlot(seurat_obj, ndims = 30)
+  dev.off()
+  
+  # Dimensionality reduction & clustering
+  seurat_obj <- RunUMAP(seurat_obj, dims = 1:20, reduction = "pca")
+  seurat_obj <- FindNeighbors(seurat_obj, dims = 1:20, reduction = "pca")
+  seurat_obj <- FindClusters(seurat_obj, resolution = 1)
+  
+  # Conditional Harmony integration (only for Ctx/Lm)
+  if (tissue_name == "Ctx/Lm") {
+    in_split <- seurat_obj
+    in_split[["RNA"]] <- split(in_split[["RNA"]], f = in_split$run)
+    in_integrated <- IntegrateLayers(
+      in_split,
+      method = HarmonyIntegration,
+      orig.reduction = "pca",
+      new.reduction = "harmony"
+    )
+    
+    # Post-Harmony visualization
+    in_integrated <- RunUMAP(in_integrated, reduction = "harmony", dims = 1:20)
+    in_integrated <- FindNeighbors(in_integrated, dims = 1:20, reduction = "harmony")
+    in_integrated <- FindClusters(in_integrated, resolution = 1)
+  } else {
+    in_integrated <- seurat_obj
+  }
+  
+  # Quick Seurat visualization (saved per object)
+  pdf(file.path(FIGURES_DIR, paste0(tissue_name, "_", timepoint, "_qc_umaps.pdf")), width = 12, height = 10)
+  print(DimPlot(in_integrated, group.by = "run", label = TRUE))
+  print(DimPlot(in_integrated, reduction = "umap", group.by = "timepoint", label = TRUE))
+  print(DimPlot(in_integrated, reduction = "umap", group.by = "tissue", label = TRUE))
+  print(DimPlot(in_integrated, reduction = "umap", group.by = "cell_subtype_final", label = TRUE))
+  dev.off()
+  
+  # CellChat workflow
+  DefaultAssay(in_integrated) <- "RNA"
+  Idents(in_integrated) <- "cell_subtype_final"
+  in_integrated <- JoinLayers(in_integrated)
+  
+  cellchat <- createCellChat(
+    object   = in_integrated,
+    meta     = in_integrated@meta.data,
+    group.by = "cell_subtype_final"
+  )
+  
+  CellChatDB <- CellChatDB.mouse
+  cellchat@DB <- CellChatDB
+  
+  # Preprocessing & inference
+  cellchat <- subsetData(cellchat)
+  cellchat <- identifyOverExpressedGenes(cellchat)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  cellchat <- projectData(cellchat, PPI.mouse)
+  
+  cellchat <- computeCommunProb(cellchat)
+  cellchat <- filterCommunication(cellchat, min.cells = 5)
+  
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+  
+  # Extract communication data
+  df.net <- subsetCommunication(cellchat)
+  
+  # Execution time
+  execution.time <- Sys.time() - ptm
+  cat("Processing time for", tissue_name, timepoint, ":", execution.time, "\n")
+  
+  return(cellchat)
+}
+
+# ── 3. Subset & process Ctx/Lm by timepoint ───────────────────────────────────
+ctx_lm <- subset(full, tissue %in% c("Ctx", "Lm"))
+ctx_lm <- subset(ctx_lm, cell_subtype_final %in% lm_ctx_cell_types)
+
+ctx_lm_ctl <- subset(ctx_lm, timepoint == "CTL")
+ctx_lm_d5  <- subset(ctx_lm, timepoint == "d5")
+ctx_lm_8w  <- subset(ctx_lm, timepoint == "8w")
+
+# Process each timepoint
+cellchat_ctx_lm_ctl <- process_seurat_cellchat(ctx_lm_ctl, lm_ctx_cell_types, "Ctx/Lm", "CTL")
+cellchat_ctx_lm_d5  <- process_seurat_cellchat(ctx_lm_d5,  lm_ctx_cell_types, "Ctx/Lm", "d5")
+cellchat_ctx_lm_8w  <- process_seurat_cellchat(ctx_lm_8w,  lm_ctx_cell_types, "Ctx/Lm", "8w")
+
+# ── 4. Merge CellChat objects ─────────────────────────────────────────────────
+cellchat_ctx_lm_merged <- mergeCellChat(
+  list(cellchat_ctx_lm_ctl, cellchat_ctx_lm_d5, cellchat_ctx_lm_8w),
+  add.names = c("Ctx_Lm_CTL", "Ctx_Lm_d5", "Ctx_Lm_8w")
+)
+
+object.list.lm <- list(
+  Ctx_Lm_CTL = cellchat_ctx_lm_ctl,
+  Ctx_Lm_d5  = cellchat_ctx_lm_d5,
+  Ctx_Lm_8w  = cellchat_ctx_lm_8w
+)
+
+# Save merged and individual objects
+saveRDS(cellchat_ctx_lm_merged, file.path(OUTPUT_DIR, "CellChat_Ctx_Lm_SplitbyTimepoints.rds"))
+saveRDS(cellchat_ctx_lm_ctl,     file.path(OUTPUT_DIR, "cellchat_ctx_lm_ctl.rds"))
+saveRDS(cellchat_ctx_lm_d5,      file.path(OUTPUT_DIR, "cellchat_ctx_lm_d5.rds"))
+saveRDS(cellchat_ctx_lm_8w,      file.path(OUTPUT_DIR, "cellchat_ctx_lm_8w.rds"))
+saveRDS(object.list.lm,          file.path(OUTPUT_DIR, "object_list_lm.rds"))
+
+# ── 5. Reload if needed (optional) ────────────────────────────────────────────
+# cellchat_ctx_lm_merged <- readRDS(file.path(OUTPUT_DIR, "CellChat_Ctx_Lm_SplitbyTimepoints.rds"))
+# cellchat_ctx_lm_ctl     <- readRDS(file.path(OUTPUT_DIR, "cellchat_ctx_lm_ctl.rds"))
+# cellchat_ctx_lm_d5      <- readRDS(file.path(OUTPUT_DIR, "cellchat_ctx_lm_d5.rds"))
+# cellchat_ctx_lm_8w      <- readRDS(file.path(OUTPUT_DIR, "cellchat_ctx_lm_8w.rds"))
+# object.list.lm          <- readRDS(file.path(OUTPUT_DIR, "object_list_lm.rds"))
+
+# ── 6. Color palette for visualization ────────────────────────────────────────
+set.seed(10)
+pal <- createPalette(45, seedcolors = c("#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377", "#BBBBBB"))
+cell_types <- sort(unique(full$cell_subtype_final))
+names(pal) <- cell_types
+
+# Subset palette to match d5 (full set)
+pal_use_subset <- pal[names(pal) %in% object.list.lm$Ctx_Lm_d5@meta$cell_subtype_final]
+
+# ── 7. Differential interaction analysis ──────────────────────────────────────
+# Compare overall interactions across timepoints
+pdf(file.path(FIGURES_DIR, "compare_interactions_weight.pdf"), width = 8, height = 6)
+compareInteractions(cellchat_ctx_lm_merged, show.legend = FALSE, group = c(1,2,3), measure = "weight")
+dev.off()
+
+# DEG-based signalling analysis (d5 as positive dataset)
+pos.dataset <- "Ctx_Lm_d5"
+features.name <- pos.dataset
+
+cellchat_ctx_lm_merged <- identifyOverExpressedGenes(
+  cellchat_ctx_lm_merged,
+  group.dataset = "datasets",
+  pos.dataset   = pos.dataset,
+  features.name = features.name,
+  only.pos      = FALSE,
+  thresh.pc     = 0.1,
+  thresh.fc     = 0.1,
+  thresh.p      = 1
+)
+
+net <- netMappingDEG(cellchat_ctx_lm_merged, features.name = features.name)
+
+net.up <- subsetCommunication(
+  cellchat_ctx_lm_merged,
+  net = net,
+  datasets = "Ctx_Lm_d5",
+  ligand.logFC = 0.1,
+  receptor.logFC = NULL
+)
+
+net.down <- subsetCommunication(
+  cellchat_ctx_lm_merged,
+  net = net,
+  datasets = "Ctx_Lm_d5",
+  ligand.logFC = -0.01,
+  receptor.logFC = -0.1
+)
+
+net.up.filtered   <- net.up[net.up$prob > 0.1 & net.up$pval < 0.05, ]
+net.down.filtered <- net.down[net.down$prob > 0.1 & net.down$pval < 0.05, ]
+
+# ── 8. Chord plots – top interactions ─────────────────────────────────────────
+pdf(file.path(FIGURES_DIR, "chord_upregulated_d5_mac_to_monocyte.pdf"), width = 10, height = 8)
+netVisual_chord_gene(
+  object.list.lm$Ctx_Lm_d5,
+  sources.use = c("diffMac", "dividingMac1", "dividingMac2", "repopMG1", "repopMG2"),
+  targets.use = c("clMonocyte"),
+  slot.name   = "net",
+  net         = net.up.filtered,
+  small.gap   = 3.5,
+  lab.cex     = 0.8,
+  legend.pos.x = 10,
+  title.name  = "Up-regulated signaling in Ctx_Lm_d5 (Mac → Monocyte)",
+  color.use   = pal_use_subset
+)
+dev.off()
+
+pdf(file.path(FIGURES_DIR, "chord_upregulated_d5_niche_to_mac.pdf"), width = 12, height = 10)
+netVisual_chord_gene(
+  object.list.lm$Ctx_Lm_d5,
+  sources.use = c("venousEC", "pialFB", "pvFB1", "pvFB2",
+                  "arterialVSMC", "venousVSMC", "PC", "arterialEC", "venousVSMC",
+                  "capillaryEC1", "capillaryEC2", "iegEC"),
+  targets.use = c("clMonocyte", "ncMonocyte", "diffMac", "dividingMac1", "dividingMac2",
+                  "repopMG1", "repopMG2", "Lyve1_CAM", "MHCII_CAM", "homMG"),
+  slot.name   = "net",
+  net         = net.up.filtered,
+  small.gap   = 3.5,
+  lab.cex     = 0.8,
+  legend.pos.x = 10,
+  title.name  = "Up-regulated signaling in Ctx_Lm_d5 (Niche → Macrophages)",
+  color.use   = pal_use_subset
+)
+dev.off()
