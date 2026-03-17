@@ -1,0 +1,651 @@
+# =============================================================================
+# Project:   Bulk RNA-seq – Stroke + CTL in Ccr2-creERT2 × tdT model (CAMs focus)
+# Script:    bulkRNAseq_Stroke_Ctrl_Ccr2_CAMs_analysis.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Load CTL + Stroke counts → combine datasets → QC → gene filtering
+#            (ribosomal/mito/pseudo/patterns) → DESeq2 (full model + combined contrasts)
+#            → PCA & heatmap → volcano plots (Stroke vs CTL per cell type, pos vs neg)
+#            → DEG heatmap (union of top DEGs) → Venn → bar plots of overlapping genes
+#            → category-specific boxplots → mean count export.
+#
+#  Note: The PBS-treated CTL dataset is the same as for the LPS data in Fig. 7
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(writexl)
+  library(ggpubr)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggrepel)
+  library(apeglm)
+  library(ashr)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(AnnotationDbi)
+  library(msigdbr)
+  library(EnhancedVolcano)
+  library(biomaRt)
+  library(ReactomePA)
+  library(OmnipathR)
+  library(fmsb)          # ggradar
+  library(ggradar)
+  library(scales)
+  library(VennDiagram)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/bulkRNAseq_Stroke_Ctrl_Ccr2_CAMs_analysis.R")
+
+CTL_COUNTS_FILE   <- here("data/raw/counts_LPS_Ccr2.txt")
+CTL_COL_DATA_FILE <- here("data/raw/colData_LPS_Ccr2.txt")
+STROKE_COUNTS_FILE   <- here("data/raw/counts_Ccr2creERT2xtdT_Stroke.txt")
+STROKE_COL_DATA_FILE <- here("data/raw/colData_Ccr2creERT2xtdT_Stroke.txt")
+
+TABLES_DIR  <- here("results/tables/stroke_ctrl_cams")
+FIGURES_DIR <- here("results/figures/stroke_ctrl_cams")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load CTL dataset ──────────────────────────────────────────────────────
+count_CTL <- read.table(CTL_COUNTS_FILE, header = TRUE, row.names = 1, sep = "\t")
+colData_CTL <- read.table(CTL_COL_DATA_FILE, header = TRUE, sep = "\t")
+
+colnames(count_CTL) <- colData_CTL$Sample
+count_CTL <- count_CTL[, match(colData_CTL$Sample, colnames(count_CTL))]
+
+# Subset to CTL only
+colData_CTL <- colData_CTL %>% filter(Condition == "CTL")
+
+colData_CTL <- colData_CTL %>%
+  mutate(
+    Treatment = "B",
+    combined  = factor(paste0(Treatment, "_", Condition)),
+    combined1 = factor(paste0(cell_type, "_", combined)),
+    QualityFlag = "-"
+  )
+
+count_CTL <- count_CTL[, colData_CTL$Sample]
+
+# ── 2. Load Stroke dataset ───────────────────────────────────────────────────
+count_data <- read.table(STROKE_COUNTS_FILE, header = TRUE, row.names = 1, sep = "\t")
+colData <- read.table(STROKE_COL_DATA_FILE, header = TRUE, sep = "\t")
+
+colnames(count_data) <- colData$Sample
+
+colData <- colData %>%
+  mutate(
+    Condition = "Stroke",
+    combined  = factor(paste0(Treatment, "_", Condition)),
+    combined1 = factor(paste0(cell_type, "_", combined))
+  )
+
+colData$Sex <- NULL
+
+# ── 3. Combine datasets (gene union + NA → 0) ────────────────────────────────
+all_genes <- union(rownames(count_CTL), rownames(count_data))
+
+counts_CTL_full <- count_CTL[match(all_genes, rownames(count_CTL)), ]
+count_data_full <- count_data[match(all_genes, rownames(count_data)), ]
+
+counts_CTL_full[is.na(counts_CTL_full)] <- 0
+count_data_full[is.na(count_data_full)] <- 0
+
+rownames(counts_CTL_full) <- all_genes
+rownames(count_data_full) <- all_genes
+
+combined_counts <- cbind(counts_CTL_full, count_data_full)
+
+combined_colData <- rbind(colData_CTL, colData)
+rownames(combined_colData) <- combined_colData$Sample
+
+cat("Combined dataset dimensions:", dim(combined_counts), "\n")
+
+# ── 4. Quality Control ───────────────────────────────────────────────────────
+total_counts <- colSums(combined_counts)
+summary(total_counts)
+
+pdf(file.path(FIGURES_DIR, "library_sizes_stroke_ctrl.pdf"), width = 10, height = 6)
+barplot(total_counts, main = "Library Sizes Smart-3 Seq Ccr2creERT2×tdT (Stroke + CTL)",
+        col = "lightblue", las = 2, cex.names = 0.7)
+dev.off()
+
+# Filter low-expressed genes (≥10 counts in ≥ half of samples)
+count_filtered <- combined_counts[rowSums(combined_counts > 10) >= ncol(combined_counts)/2, ]
+cat("Genes after low-count filter:", nrow(count_filtered), "\n")
+
+# ── 5. Gene filtering (ribosomal, mitochondrial, pseudogenes, patterns) ───────
+ribosomal_genes <- msigdbr(species = "Mus musculus", category = "C2") %>%
+  filter(gs_name == "KEGG_RIBOSOME") %>% pull(gene_symbol)
+
+mitochondrial_genes <- msigdbr(species = "Mus musculus", category = "C2") %>%
+  filter(gs_name == "KEGG_OXIDATIVE_PHOSPHORYLATION") %>% pull(gene_symbol)
+
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl", host = "https://www.ensembl.org")
+
+pseudogenes <- getBM(attributes = c("external_gene_name"),
+                     filters = "biotype",
+                     values = c("pseudogene", "predicted", "novel", "uncharacterized"),
+                     mart = mart) %>% pull(external_gene_name)
+
+non_coding_genes <- getBM(attributes = c("external_gene_name"),
+                          filters = "biotype",
+                          values = c("lincRNA", "miRNA", "snRNA", "snoRNA"),
+                          mart = mart) %>% pull(external_gene_name)
+
+ex_genes <- unique(c(ribosomal_genes, mitochondrial_genes, pseudogenes, non_coding_genes))
+ex_genes <- trimws(ex_genes)
+
+count_filtered <- count_filtered[!rownames(count_filtered) %in% ex_genes, ]
+
+# Pattern-based exclusion
+patterns <- c("Mrp", "Rpl", "Rps", "Sn", "Sf", "Gtf", "Med", "Rbm", "Rik",
+              "Lsm", "Eif", "Atp", "Nduf", "Tomm", "Pol", "Anap", "Rna", "Gm", "Ddx",
+              "Smim", "Zfp", "Bola", "Dna", "Timm", "Micos")
+
+ex_genes_pattern <- grep(paste(patterns, collapse = "|"), rownames(count_filtered), value = TRUE)
+
+count_filtered <- count_filtered[!rownames(count_filtered) %in% ex_genes_pattern, ]
+
+cat("Remaining genes after all filtering:", nrow(count_filtered), "\n")
+
+# ── 6. DESeq2 – Full model ───────────────────────────────────────────────────
+design_formula <- ~ cell_type + Treatment + Condition
+
+dds <- DESeqDataSetFromMatrix(
+  countData = count_filtered,
+  colData   = combined_colData,
+  design    = design_formula
+)
+
+dds <- estimateSizeFactors(dds)
+dds <- DESeq(dds)
+
+# VST for visualization
+vsd <- vst(dds, blind = TRUE)
+vsd_mat <- assay(vsd)
+
+# ── 7. PCA Plot ──────────────────────────────────────────────────────────────
+pca_data <- plotPCA(vsd, intgroup = c("cell_type", "Treatment", "Condition"), returnData = TRUE, ntop = 500)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+p_pca <- ggplot(pca_data, aes(PC1, PC2, color = cell_type, shape = Treatment)) +
+  geom_point(size = 4, stroke = 1) +
+  xlab(paste0("PC1: ", percent_var[1], "% variance")) +
+  ylab(paste0("PC2: ", percent_var[2], "% variance")) +
+  labs(title = "PCA of RNA-seq Data (Stroke + CTL)") +
+  guides(color = guide_legend(override.aes = list(shape = c(16)))) +
+  guides(shape = guide_legend(override.aes = list(shape = c(16, 17)))) +
+  theme_minimal()
+
+ggsave(file.path(FIGURES_DIR, "pca_stroke_ctrl.pdf"), p_pca, width = 8, height = 6)
+
+# ── 8. Unbiased Heatmap – Top 250 variable genes ──────────────────────────────
+gene_variances <- apply(vsd_mat, 1, var)
+top_variable_genes <- order(gene_variances, decreasing = TRUE)[1:250]
+vsd_mat_top <- vsd_mat[top_variable_genes, ]
+
+annotation_col <- as.data.frame(combined_colData[, c("cell_type", "Treatment", "Condition"), drop = FALSE])
+rownames(annotation_col) <- combined_colData$Sample
+
+pheatmap(
+  vsd_mat_top,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  fontsize = 5,
+  fontsize_row = 5,
+  fontsize_col = 8,
+  annotation_col = annotation_col,
+  filename = file.path(FIGURES_DIR, "heatmap_top250_variable_genes.pdf")
+)
+
+# ── 9. Stroke activation contrasts ────────────────────────────────────────────
+design_comb1 <- ~ combined1
+
+dds_comb1 <- DESeqDataSetFromMatrix(
+  countData = count_filtered,
+  colData   = combined_colData,
+  design    = design_comb1
+)
+
+dds_comb1 <- estimateSizeFactors(dds_comb1)
+dds_comb1 <- DESeq(dds_comb1)
+
+# MG BLZ Stroke vs BLZ CTL
+dds_comb1$combined1 <- relevel(dds_comb1$combined1, ref = "MG_B_CTL")
+dds_comb1 <- nbinomWaldTest(dds_comb1)
+MG_BLZ_Stroke <- lfcShrink(dds_comb1, coef = "combined1_MG_B_Stroke_vs_MG_B_CTL", type = "apeglm")
+
+df_mg_b <- as.data.frame(MG_BLZ_Stroke)
+df_mg_b$significant <- df_mg_b$padj < 0.05 & !is.na(df_mg_b$padj)
+df_mg_b$upregulated   <- df_mg_b$significant & df_mg_b$log2FoldChange > 0.59
+df_mg_b$downregulated <- df_mg_b$significant & df_mg_b$log2FoldChange < -0.59
+
+cat("MG BLZ Stroke vs BLZ CTL:\n")
+cat("Significant genes (padj < 0.05):", sum(df_mg_b$significant), "\n")
+cat("Upregulated (padj < 0.05 & log2FC > 0.59):", sum(df_mg_b$upregulated), "\n")
+cat("Downregulated (padj < 0.05 & log2FC < -0.59):", sum(df_mg_b$downregulated), "\n\n")
+
+# MG Veh Stroke vs BLZ CTL
+MG_V_Stroke <- lfcShrink(dds_comb1, coef = "combined1_MG_V_Stroke_vs_MG_B_CTL", type = "apeglm")
+
+df_mg <- as.data.frame(MG_V_Stroke)
+df_mg$significant <- df_mg$padj < 0.05 & !is.na(df_mg$padj)
+df_mg$upregulated   <- df_mg$significant & df_mg$log2FoldChange > 0.59
+df_mg$downregulated <- df_mg$significant & df_mg$log2FoldChange < -0.59
+
+cat("MG Veh Stroke vs BLZ CTL:\n")
+cat("Significant genes (padj < 0.05):", sum(df_mg$significant), "\n")
+cat("Upregulated (padj < 0.05 & log2FC > 0.59):", sum(df_mg$upregulated), "\n")
+cat("Downregulated (padj < 0.05 & log2FC < -0.59):", sum(df_mg$downregulated), "\n\n")
+
+# MG BLZ Stroke vs MG Veh Stroke
+dds_comb1$combined1 <- relevel(dds_comb1$combined1, ref = "MG_V_Stroke")
+dds_comb1 <- nbinomWaldTest(dds_comb1)
+MG_B_vs_V_Stroke <- lfcShrink(dds_comb1, coef = "combined1_MG_B_Stroke_vs_MG_V_Stroke", type = "apeglm")
+
+# neg BLZ Stroke vs neg BLZ CTL
+dds_comb1$combined1 <- relevel(dds_comb1$combined1, ref = "neg_B_CTL")
+dds_comb1 <- nbinomWaldTest(dds_comb1)
+neg_B_Stroke <- lfcShrink(dds_comb1, coef = "combined1_neg_B_Stroke_vs_neg_B_CTL", type = "apeglm")
+
+df_neg <- as.data.frame(neg_B_Stroke)
+df_neg$significant <- df_neg$padj < 0.05 & !is.na(df_neg$padj)
+df_neg$upregulated   <- df_neg$significant & df_neg$log2FoldChange > 0.59
+df_neg$downregulated <- df_neg$significant & df_neg$log2FoldChange < -0.59
+
+cat("neg BLZ Stroke vs neg BLZ CTL:\n")
+cat("Significant genes (padj < 0.05):", sum(df_neg$significant), "\n")
+cat("Upregulated (padj < 0.05 & log2FC > 0.59):", sum(df_neg$upregulated), "\n")
+cat("Downregulated (padj < 0.05 & log2FC < -0.59):", sum(df_neg$downregulated), "\n\n")
+
+# pos BLZ Stroke vs pos BLZ CTL
+dds_comb1$combined1 <- relevel(dds_comb1$combined1, ref = "pos_B_CTL")
+dds_comb1 <- nbinomWaldTest(dds_comb1)
+pos_B_Stroke <- lfcShrink(dds_comb1, coef = "combined1_pos_B_Stroke_vs_pos_B_CTL", type = "apeglm")
+
+df_pos <- as.data.frame(pos_B_Stroke)
+df_pos$significant <- df_pos$padj < 0.05 & !is.na(df_pos$padj)
+df_pos$upregulated   <- df_pos$significant & df_pos$log2FoldChange > 0.59
+df_pos$downregulated <- df_pos$significant & df_pos$log2FoldChange < -0.59
+
+cat("pos BLZ Stroke vs pos BLZ CTL:\n")
+cat("Significant genes (padj < 0.05):", sum(df_pos$significant), "\n")
+cat("Upregulated (padj < 0.05 & log2FC > 0.59):", sum(df_pos$upregulated), "\n")
+cat("Downregulated (padj < 0.05 & log2FC < -0.59):", sum(df_pos$downregulated), "\n\n")
+
+# neg Veh Stroke vs neg BLZ CTL
+neg_V_Stroke <- lfcShrink(dds_comb1, coef = "combined1_neg_V_Stroke_vs_neg_B_CTL", type = "apeglm")
+
+# pos BLZ Stroke vs neg BLZ Stroke
+dds_comb1$combined1 <- relevel(dds_comb1$combined1, ref = "neg_B_Stroke")
+dds_comb1 <- nbinomWaldTest(dds_comb1)
+pos_vs_neg_B_Stroke <- lfcShrink(dds_comb1, coef = "combined1_pos_B_Stroke_vs_neg_B_Stroke", type = "apeglm")
+
+# ── 10. CAM-only analysis (pos vs neg in Stroke) ──────────────────────────────
+colData_CAM <- combined_colData[combined_colData$combined1 %in% c("neg_V_Stroke", "neg_B_Stroke", "pos_B_Stroke"), ]
+count_filt_CAM <- count_filtered[, colnames(count_filtered) %in% colData_CAM$Sample]
+
+design_formula_CAM <- ~ combined1
+
+dds_CAM <- DESeqDataSetFromMatrix(
+  countData = count_filt_CAM,
+  colData   = colData_CAM,
+  design    = design_formula_CAM
+)
+
+dds_CAM <- estimateSizeFactors(dds_CAM)
+dds_CAM <- DESeq(dds_CAM)
+
+# pos vs neg (BLZ Stroke)
+dds_CAM$combined1 <- relevel(dds_CAM$combined1, ref = "neg_B_Stroke")
+dds_CAM <- nbinomWaldTest(dds_CAM)
+Stroke_CAM_pos_vs_neg <- lfcShrink(dds_CAM, coef = "combined1_pos_B_Stroke_vs_neg_B_Stroke", type = "apeglm")
+
+p_volc_pos_vs_neg <- EnhancedVolcano(
+  Stroke_CAM_pos_vs_neg,
+  lab = rownames(Stroke_CAM_pos_vs_neg),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 0.59,
+  title = "CAMs pos vs neg (Stroke)",
+  max.overlaps = 100, labSize = 2
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_pos_vs_neg_Stroke.pdf"), p_volc_pos_vs_neg, width = 8, height = 6)
+
+# pos BLZ Stroke vs neg Veh Stroke
+dds_CAM$combined1 <- relevel(dds_CAM$combined1, ref = "neg_V_Stroke")
+dds_CAM <- nbinomWaldTest(dds_CAM)
+Stroke_CAM_pos_vs_neg_V <- lfcShrink(dds_CAM, coef = "combined1_pos_B_Stroke_vs_neg_V_Stroke", type = "apeglm")
+
+p_volc_pos_vs_neg_V <- EnhancedVolcano(
+  Stroke_CAM_pos_vs_neg_V,
+  lab = rownames(Stroke_CAM_pos_vs_neg_V),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 0.59,
+  title = "CAMs pos BLZ Stroke vs neg Veh Stroke",
+  max.overlaps = 100, labSize = 2
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_pos_BLZ_vs_neg_Veh_Stroke.pdf"), p_volc_pos_vs_neg_V, width = 8, height = 6)
+
+# ── 11. DEG Heatmap (union of top DEGs from all contrasts) ─────────────────────
+filter_deg <- function(res) {
+  res <- res[!is.na(res$padj) & !is.na(res$log2FoldChange), ]
+  res <- res[res$padj < 0.05 & abs(res$log2FoldChange) > 0.59, ]
+  return(res)
+}
+
+MG_BLZ_Stroke_heat   <- filter_deg(MG_BLZ_Stroke)
+MG_V_Stroke_heat     <- filter_deg(MG_V_Stroke)
+MG_B_vs_V_Stroke_heat <- filter_deg(MG_B_vs_V_Stroke)
+neg_B_Stroke_heat    <- filter_deg(neg_B_Stroke)
+pos_B_Stroke_heat    <- filter_deg(pos_B_Stroke)
+pos_vs_neg_B_Stroke_heat <- filter_deg(pos_vs_neg_B_Stroke)
+Stroke_CAM_pos_vs_neg_heat <- filter_deg(Stroke_CAM_pos_vs_neg)
+Stroke_CAM_B_pos_vs_V_neg_heat <- filter_deg(Stroke_CAM_pos_vs_neg_V)
+
+top_n <- 100
+
+MG_BLZ_Stroke_top   <- MG_BLZ_Stroke_heat[order(MG_BLZ_Stroke_heat$padj), ][1:top_n, ]
+MG_V_Stroke_top     <- MG_V_Stroke_heat[order(MG_V_Stroke_heat$padj), ][1:top_n, ]
+MG_B_vs_V_Stroke_top <- MG_B_vs_V_Stroke_heat[order(MG_B_vs_V_Stroke_heat$padj), ][1:10, ]
+neg_B_Stroke_top    <- neg_B_Stroke_heat[order(neg_B_Stroke_heat$padj), ][1:top_n, ]
+pos_B_Stroke_top    <- pos_B_Stroke_heat[order(pos_B_Stroke_heat$padj), ][1:top_n, ]
+pos_vs_neg_B_Stroke_top <- pos_vs_neg_B_Stroke_heat[order(pos_vs_neg_B_Stroke_heat$padj), ][1:55, ]
+Stroke_CAM_pos_vs_neg_top <- Stroke_CAM_pos_vs_neg_heat[order(Stroke_CAM_pos_vs_neg_heat$padj), ][1:57, ]
+Stroke_CAM_B_pos_vs_V_neg_top <- Stroke_CAM_B_pos_vs_V_neg_heat[order(Stroke_CAM_B_pos_vs_V_neg_heat$padj), ][1:top_n, ]
+
+genes <- unique(c(
+  rownames(MG_BLZ_Stroke_top),
+  rownames(MG_V_Stroke_top),
+  rownames(MG_B_vs_V_Stroke_top),
+  rownames(neg_B_Stroke_top),
+  rownames(pos_B_Stroke_top),
+  rownames(pos_vs_neg_B_Stroke_top),
+  rownames(Stroke_CAM_pos_vs_neg_top),
+  rownames(Stroke_CAM_B_pos_vs_V_neg_top)
+))
+
+dds_mat <- counts(dds, normalized = TRUE)
+mat <- dds_mat[rownames(dds_mat) %in% genes, ]
+
+mat_df <- as.data.frame(mat)
+transposed_mat <- t(mat_df)
+scaled_mat <- scale(transposed_mat, center = TRUE, scale = TRUE)
+scaled_mat <- t(scaled_mat)
+
+annotation_col <- as.data.frame(combined_colData[, c("cell_type", "Treatment", "Condition"), drop = FALSE])
+rownames(annotation_col) <- combined_colData$Sample
+
+pheatmap(
+  scaled_mat,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  fontsize = 5,
+  fontsize_row = 3,
+  fontsize_col = 8,
+  annotation_col = annotation_col,
+  show_colnames = FALSE,
+  filename = file.path(FIGURES_DIR, "heatmap_DEG_stroke_ctrl_union.pdf")
+)
+
+# ── 12. Venn diagram – upregulated stroke-induced genes ───────────────────────
+deg_neg_b_stroke <- neg_B_Stroke[!is.na(neg_B_Stroke$padj) & neg_B_Stroke$padj < 0.05 & neg_B_Stroke$log2FoldChange > 0.59, ]
+deg_pos_b_stroke <- pos_B_Stroke[!is.na(pos_B_Stroke$padj) & pos_B_Stroke$padj < 0.05 & pos_B_Stroke$log2FoldChange > 0.59, ]
+deg_neg_v_stroke <- neg_V_Stroke[!is.na(neg_V_Stroke$padj) & neg_V_Stroke$padj < 0.05 & neg_V_Stroke$log2FoldChange > 0.59, ]
+
+genes_deg_neg_b_stroke <- rownames(deg_neg_b_stroke)
+genes_deg_pos_b_stroke <- rownames(deg_pos_b_stroke)
+genes_deg_neg_v_stroke <- rownames(deg_neg_v_stroke)
+
+venn.plot <- venn.diagram(
+  x = list(
+    `neg_blz_stroke` = genes_deg_neg_b_stroke,
+    `pos_blz_stroke` = genes_deg_pos_b_stroke,
+    `neg_veh_stroke` = genes_deg_neg_v_stroke
+  ),
+  filename = NULL,
+  fill = c("#E69F00", "#56B4E9", "#AF69EE"),
+  alpha = 0.5,
+  cex = 2,
+  cat.cex = 1.5,
+  cat.pos = c(0, 0, 0),
+  main = "Venn Diagram of stroke activation Signatures of post-BLZ CNS-associated macrophages",
+  main.cex = 1.5
+)
+
+pdf(file.path(FIGURES_DIR, "venn_stroke_activation_signatures.pdf"))
+grid.draw(venn.plot)
+dev.off()
+
+# Unique genes
+neg_b_specific <- setdiff(genes_deg_neg_b_stroke, union(genes_deg_neg_v_stroke, genes_deg_pos_b_stroke))
+neg_v_specific <- setdiff(genes_deg_neg_v_stroke, union(genes_deg_neg_b_stroke, genes_deg_pos_b_stroke))
+pos_b_specific <- setdiff(genes_deg_pos_b_stroke, union(genes_deg_neg_b_stroke, genes_deg_neg_v_stroke))
+
+non_intersecting_genes <- list(
+  neg_b_specific = neg_b_specific,
+  neg_v_specific = neg_v_specific,
+  pos_b_specific = pos_b_specific
+)
+
+print(non_intersecting_genes)
+
+# ── 13. Bar plot – overlapping CAM stroke-induced genes higher in each condition ──
+common_stroke_genes <- Reduce(union, list(genes_deg_neg_b_stroke, genes_deg_pos_b_stroke, genes_deg_neg_v_stroke))
+cat("Number of overlapping genes:", length(common_stroke_genes), "\n")
+
+norm_counts <- counts(dds, normalized = TRUE)[common_stroke_genes, , drop = FALSE]
+
+mean_counts <- data.frame(Gene = rownames(norm_counts))
+for (cond in unique(combined_colData$combined1)) {
+  mean_counts[[cond]] <- rowMeans(norm_counts[, combined_colData$combined1 == cond, drop = FALSE])
+}
+
+mean_counts$Higher_In <- colnames(mean_counts)[-1][apply(mean_counts[,-1], 1, which.max)]
+
+counts_summary <- mean_counts %>%
+  group_by(Higher_In) %>%
+  summarise(Count = n()) %>%
+  ungroup() %>%
+  complete(Higher_In = unique(combined_colData$combined1), fill = list(Count = 0))
+
+chi_test <- chisq.test(counts_summary$Count)
+p_value <- format.pval(chi_test$p.value, digits = 2)
+
+condition_colors <- setNames(RColorBrewer::brewer.pal(n = nrow(counts_summary), "Set2"), counts_summary$Higher_In)
+
+p_bar <- ggplot(counts_summary, aes(x = Higher_In, y = Count, fill = Higher_In)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  labs(title = paste("Number of Overlapping Genes Higher in Each Condition\nChi-Square p =", p_value),
+       x = "Condition", y = "Number of Genes") +
+  scale_fill_manual(values = condition_colors) +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(FIGURES_DIR, "bar_overlapping_stroke_genes.pdf"), p_bar, width = 10, height = 6)
+
+# ── 14. Average highest mean expression distance to second ─────────────────────
+condition_cols <- setdiff(colnames(mean_counts), c("Gene", "Higher_In"))
+
+mean_counts_avg <- mean_counts %>%
+  rowwise() %>%
+  mutate(
+    sorted_values = list(sort(c_across(all_of(condition_cols)), decreasing = TRUE)),
+    Highest = sorted_values[[1]],
+    Second_Highest = sorted_values[[2]],
+    Percent_Higher = ((Highest / Second_Highest) - 1) * 100
+  ) %>%
+  ungroup() %>%
+  dplyr::select(Gene, all_of(condition_cols), Higher_In, Percent_Higher)
+
+group_stats_filtered <- mean_counts_avg %>%
+  filter(Percent_Higher >= 10 & Percent_Higher <= 100) %>%
+  group_by(Higher_In) %>%
+  summarise(
+    mean_percent = mean(Percent_Higher, na.rm = TRUE),
+    sd_percent = sd(Percent_Higher, na.rm = TRUE),
+    n = sum(!is.na(Percent_Higher)),
+    sem_percent = sd_percent / sqrt(n)
+  )
+
+p_percent_bar <- ggplot(group_stats_filtered, aes(x = Higher_In, y = mean_percent, fill = Higher_In)) +
+  geom_bar(stat = "identity", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_percent - sem_percent, ymax = mean_percent + sem_percent),
+                width = 0.3, color = "black") +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 10), expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "Mean Percent Difference (Filtered >10%) Between Top and Second-Highest Expression",
+       x = "Condition (Highest Expression Group)",
+       y = "Mean Percent Higher Than Second-Highest (%)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c(
+    "pos_B_Stroke" = "#00A9FF",
+    "neg_B_Stroke" = "#F8766D",
+    "neg_V_Stroke" = "#E69F00",
+    "MG_B_Stroke" = "#56B4E9",
+    "MG_V_Stroke" = "#AF69EE"
+  ))
+
+ggsave(file.path(FIGURES_DIR, "bar_percent_higher_stroke.pdf"), p_percent_bar, width = 10, height = 6)
+
+# ── 15. Overlap check & volcano overlays ──────────────────────────────────────
+# CAM pos vs neg overlay (example shown; repeat pattern for MG)
+deg_neg_b_stroke_both <- neg_B_Stroke[!is.na(neg_B_Stroke$padj) & neg_B_Stroke$padj < 0.05 & abs(neg_B_Stroke$log2FoldChange) > 0.59, ]
+
+volcano_df <- pos_B_Stroke %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "gene") %>%
+  mutate(
+    neg_log10_padj = -log10(padj),
+    sig_any   = padj < 0.05 & !is.na(padj),
+    in_both   = gene %in% intersect(rownames(deg_neg_b_stroke_both), rownames(deg_neg_b_stroke_both)),
+    in_both_blue = in_both & abs(log2FoldChange) < -0.59
+  )
+
+p_cam_overlay <- ggplot(volcano_df, aes(x = log2FoldChange, y = neg_log10_padj)) +
+  geom_point(data = subset(volcano_df, !sig_any), color = "grey70", size = 1.2, alpha = 0.7) +
+  geom_point(data = subset(volcano_df, sig_any & in_both & log2FoldChange < -0.59),
+             color = "blue", size = 1.8) +
+  geom_point(data = subset(volcano_df, sig_any & !in_both), color = "grey50", size = 1.5) +
+  geom_point(data = subset(volcano_df, sig_any & in_both & log2FoldChange >= 0.59),
+             color = "#d7191c", size = 1.8) +
+  geom_text(data = subset(volcano_df, sig_any), aes(label = gene),
+            size = 2, vjust = -0.8, color = "black") +
+  geom_vline(xintercept = c(-0.59, 0.59), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  labs(
+    title = "Volcano plot: pos_BLZ_stroke vs pos_BLZ_CTL",
+    subtitle = paste(sum(volcano_df$in_both), "genes significant in both comparisons"),
+    x = expression(Log[2]*" Fold Change"),
+    y = expression(-Log[10]*" adjusted p-value")
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_pos_BLZ_overlay.pdf"), p_cam_overlay, width = 8, height = 6)
+
+# MG repop vs CTL overlay (example shown)
+deg_MG_V_Stroke <- MG_V_Stroke[!is.na(MG_V_Stroke$padj) & MG_V_Stroke$padj < 0.05 & abs(MG_V_Stroke$log2FoldChange) > 0.59, ]
+
+volcano_df_mg <- MG_BLZ_Stroke %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "gene") %>%
+  mutate(
+    neg_log10_padj = -log10(padj),
+    sig_any   = padj < 0.05 & !is.na(padj),
+    in_both   = gene %in% intersect(rownames(deg_MG_V_Stroke), rownames(deg_MG_V_Stroke)),
+    in_both_blue = in_both & log2FoldChange < -0.59
+  )
+
+p_mg_overlay <- ggplot(volcano_df_mg, aes(x = log2FoldChange, y = neg_log10_padj)) +
+  geom_point(data = subset(volcano_df_mg, !sig_any), color = "grey70", size = 1.2, alpha = 0.7) +
+  geom_point(data = subset(volcano_df_mg, sig_any & in_both & log2FoldChange < -0.59),
+             color = "blue", size = 1.8) +
+  geom_point(data = subset(volcano_df_mg, sig_any & !in_both), color = "grey50", size = 1.5) +
+  geom_point(data = subset(volcano_df_mg, sig_any & in_both & log2FoldChange >= 0.59),
+             color = "#d7191c", size = 1.8) +
+  geom_text(data = subset(volcano_df_mg, sig_any), aes(label = gene),
+            size = 2, vjust = -0.8, color = "black") +
+  geom_vline(xintercept = c(-0.59, 0.59), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  labs(
+    title = "Volcano plot: pos_MG_Stroke vs pos_MG_CTL",
+    subtitle = paste(sum(volcano_df_mg$in_both), "genes significant in both MG comparisons"),
+    x = expression(Log[2]*" Fold Change"),
+    y = expression(-Log[10]*" adjusted p-value")
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+
+ggsave(file.path(FIGURES_DIR, "volcano_MG_pos_overlay.pdf"), p_mg_overlay, width = 8, height = 6)
+
+# ── 16. Stroke milieu genes boxplots on CAMs ──────────────────────────────────
+colData_stroke <- combined_colData[combined_colData$combined1 %in% c("neg_V_Stroke", "neg_B_Stroke", "pos_B_Stroke"), ]
+count_filt_stroke <- count_filtered[, colnames(count_filtered) %in% colData_stroke$Sample]
+
+design_formula_stroke <- ~ combined1
+
+dds_stroke <- DESeqDataSetFromMatrix(
+  countData = count_filt_stroke,
+  colData   = colData_stroke,
+  design    = design_formula_stroke
+)
+
+dds_stroke <- estimateSizeFactors(dds_stroke)
+dds_stroke <- DESeq(dds_stroke)
+
+genes <- intersect(common_stroke_genes, rownames(dds_stroke))
+
+plots <- lapply(genes, function(g) {
+  df <- plotCounts(dds_stroke, gene = g, intgroup = "combined1", returnData = TRUE)
+  df$log_count <- log2(df$count + 1)
+  
+  anova_result <- aov(log_count ~ combined1, data = df)
+  anova_p <- summary(anova_result)[[1]][["Pr(>F)"]][1]
+  
+  if (anova_p < 0.05) {
+    tukey_result <- TukeyHSD(anova_result)
+    p_vals <- tukey_result$combined1[, "p adj"]
+    sig_p_vals <- p_vals[p_vals < 0.05]
+    labels <- if (length(sig_p_vals) > 0) {
+      paste(names(sig_p_vals), sprintf("p=%.5f", sig_p_vals), sep = ": ")
+    } else {
+      "No sig. pairwise diffs"
+    }
+  } else {
+    labels <- "ANOVA NS"
+  }
+  
+  p <- ggplot(df, aes(x = combined1, y = count, fill = combined1)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.6) +
+    labs(title = g, x = "", y = "Normalized Counts") +
+    theme_minimal() +
+    theme(axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          legend.position = "none") +
+    annotate("text", x = Inf, y = Inf, label = paste(labels, collapse = "\n"),
+             hjust = 1, vjust = 1, size = 2.5, color = "black")
+  
+  return(p)
+})
+
+combined_plot <- ggarrange(plotlist = plots,
+                           ncol = 4,
+                           nrow = ceiling(length(plots) / 4),
+                           common.legend = TRUE,
+                           legend = "right")
+
+pdf(file.path(FIGURES_DIR, "boxplots_stroke_milieu_genes_on_CAMs.pdf"), width = 15, height = 10)
+print(combined_plot)
+dev.off()
