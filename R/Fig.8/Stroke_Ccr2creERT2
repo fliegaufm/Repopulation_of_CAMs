@@ -399,6 +399,98 @@ pheatmap(
 )
 
 # ── 12. Venn diagram – upregulated stroke-induced genes ───────────────────────
+
+#Define Background
+background_genes <- rownames(count_filtered)
+org_db <- org.Mm.eg.db
+
+### Compare pos vs neg from only CAMs analysis (stroke data)
+neg_B_Stroke_up <- neg_B_Stroke[!is.na(neg_B_Stroke$padj) & neg_B_Stroke$padj < 0.05 & neg_B_Stroke$log2FoldChange > 0, ]
+pos_B_Stroke_up <- pos_B_Stroke[!is.na(pos_B_Stroke$padj) & pos_B_Stroke$padj < 0.05 & pos_B_Stroke$log2FoldChange > 0, ]
+neg_V_Stroke_up <- neg_V_Stroke[!is.na(neg_V_Stroke$padj) & neg_V_Stroke$padj < 0.05 & neg_V_Stroke$log2FoldChange > 0, ]
+MG_BLZ_Stroke_up <- MG_BLZ_Stroke[!is.na(MG_BLZ_Stroke$padj) & MG_BLZ_Stroke$padj < 0.05 & MG_BLZ_Stroke$log2FoldChange > 0, ]
+MG_V_Stroke_up <- MG_V_Stroke[!is.na(MG_V_Stroke$padj) & MG_V_Stroke$padj < 0.05 & MG_V_Stroke$log2FoldChange > 0, ]
+
+# Extract the gene names from the subsets
+sign_neg_B <- rownames(neg_B_Stroke_up)
+sign_pos_B <- rownames(pos_B_Stroke_up)
+sign_neg_V <- rownames(neg_V_Stroke_up)
+sign_mg_B <- rownames(MG_BLZ_Stroke_up)
+sign_mg_V <- rownames(MG_V_Stroke_up)
+
+# Perform GO term analysis for neg_B_Stroke_up genes
+enrichGO_result_neg_B <- enrichGO(
+  gene = sign_neg_B,
+  OrgDb = org.Mm.eg.db,
+  universe = background_genes,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  minGSSize = 3,
+  maxGSSize = 500,
+  keyType = "SYMBOL"
+)
+
+ego_neg_B <- clusterProfiler::simplify(enrichGO_result_neg_B, 
+                      cutoff = 0.6,  
+                      by = "p.adjust",
+                      measure = "Wang")
+
+# Bar plot for neg_B_Stroke_up
+barplot(ego_neg_B, showCategory = 10, title = "GO Stroke neg_B") +
+  scale_fill_gradient(low = "#00A9FF", high = "white", name = "adjusted p-value") +
+  theme_minimal() +
+  geom_bar(stat = "identity", color = "black")
+
+enrichGO_result_pos_B <- enrichGO(
+  gene = sign_pos_B,
+  OrgDb = org.Mm.eg.db,
+  universe = background_genes,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  minGSSize = 3,
+  maxGSSize = 500,
+  keyType = "SYMBOL"
+)
+
+ego_pos_B <- clusterProfiler::simplify(enrichGO_result_pos_B, 
+                      cutoff = 0.6,  
+                      by = "p.adjust",
+                      measure = "Wang")
+
+barplot(ego_pos_B, showCategory = 10, title = "GO Stroke pos_B") +
+  scale_fill_gradient(low = "#F8766D", high = "white", name = "adjusted p-value") +
+  theme_minimal() +
+  geom_bar(stat = "identity", color = "black")
+
+enrichGO_result_neg_V <- enrichGO(
+  gene = sign_neg_V,
+  OrgDb = org.Mm.eg.db,
+  universe = background_genes,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  minGSSize = 3,
+  maxGSSize = 500,
+  keyType = "SYMBOL"
+)
+
+ego_neg_V <- clusterProfiler::simplify(enrichGO_result_neg_V, 
+                      cutoff = 0.6,  
+                      by = "p.adjust",
+                      measure = "Wang")
+
+barplot(ego_neg_V, showCategory = 10, title = "GO Stroke neg_V") +
+  scale_fill_gradient(low = "#7CAE00", high = "white", name = "adjusted p-value") +
+  theme_minimal() +
+  geom_bar(stat = "identity", color = "black")
+
+
+# ── 12. Venn diagram – upregulated stroke-induced genes ───────────────────────
 deg_neg_b_stroke <- neg_B_Stroke[!is.na(neg_B_Stroke$padj) & neg_B_Stroke$padj < 0.05 & neg_B_Stroke$log2FoldChange > 0.59, ]
 deg_pos_b_stroke <- pos_B_Stroke[!is.na(pos_B_Stroke$padj) & pos_B_Stroke$padj < 0.05 & pos_B_Stroke$log2FoldChange > 0.59, ]
 deg_neg_v_stroke <- neg_V_Stroke[!is.na(neg_V_Stroke$padj) & neg_V_Stroke$padj < 0.05 & neg_V_Stroke$log2FoldChange > 0.59, ]
