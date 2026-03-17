@@ -1,0 +1,227 @@
+# =============================================================================
+# Project:   scATAC-seq – CAM repopulation in Mrc1CreERT2 R26tdT model
+# Script:    scATACseq_PostQC_CAM_Repop_Mrc1.R
+# Author:    MAximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Load merged & QC-filtered scATAC object → add annotations →
+#            compute gene activities → integrate with scRNA-seq labels →
+#            call peaks per cell type → create new peak assay → re-run LSI/UMAP
+#            → add called-peak gene activities → final metadata → save.
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Signac)
+  library(GenomeInfoDb)
+  library(EnsDb.Mmusculus.v79)
+  library(GenomicRanges)
+  library(ggplot2)
+  library(JASPAR2020)
+  library(TFBSTools)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  library(biovizBase)
+  library(reticulate)
+  library(scDblFinder)
+  library(Seurat)
+  library(dplyr)
+  library(Seqinfo)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/scATACseq_PostQC_CAM_Repop_Mrc1.R")
+
+INPUT_RDS     <- here("results/objects/merged_final.rds")
+SCRNA_RDS     <- here("data/processed/for_atac_seq_annotation.rds")
+MACS3_PATH    <- "/Users/maximilian/Library/Python/3.9/bin/macs3"
+
+FIGURES_DIR   <- here("results/figures/scATAC_postQC")
+RDS_DIR       <- here("results/objects")
+
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(RDS_DIR,     recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load merged QC object ─────────────────────────────────────────────────
+merged <- readRDS(INPUT_RDS)
+cat("Loaded merged object:", dim(merged), "\n")
+
+DefaultAssay(merged) <- "peaks"
+
+# ── 2. Add gene annotations (mm10 EnsDb) ─────────────────────────────────────
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevels(annotations) <- paste0("chr", seqlevels(annotations))
+genome(annotations) <- "mm10"
+Annotation(merged) <- annotations
+
+# ── 3. Compute gene activities (from unified peaks) ───────────────────────────
+gene.activities <- GeneActivity(merged)
+
+merged[["RNA"]] <- CreateAssayObject(counts = gene.activities)
+
+merged <- NormalizeData(
+  object               = merged,
+  assay                = "RNA",
+  normalization.method = "LogNormalize",
+  scale.factor         = median(merged$nCount_RNA)
+)
+
+DefaultAssay(merged) <- "RNA"
+
+pdf(file.path(FIGURES_DIR, "feature_plot_marker_genes.pdf"), width = 12, height = 10)
+FeaturePlot(
+  merged,
+  features = c("Mrc1", "Sall1", "Tmem119", "Cx3cr1", "Igf1", "Ccr2", "H2-Aa", "Lyve1", "Colec12"),
+  ncol = 3
+)
+dev.off()
+
+pdf(file.path(FIGURES_DIR, "dimplot_by_sample.pdf"), width = 8, height = 6)
+DimPlot(merged, group.by = "sample")
+dev.off()
+
+pdf(file.path(FIGURES_DIR, "dimplot_clusters.pdf"), width = 8, height = 6)
+DimPlot(merged, label = TRUE)
+dev.off()
+
+# ── 4. Integration with scRNA-seq (label transfer) ────────────────────────────
+scrnaseq <- readRDS(SCRNA_RDS)
+scrnaseq <- UpdateSeuratObject(scrnaseq)
+scrnaseq <- FindVariableFeatures(scrnaseq, assay = "RNA", nfeatures = 5000)
+
+transfer.anchors <- FindTransferAnchors(
+  reference         = scrnaseq,
+  query             = merged,
+  reduction         = "cca",
+  dims              = 1:30
+)
+
+predicted.labels <- TransferData(
+  anchorset         = transfer.anchors,
+  refdata           = scrnaseq$cell_subtype_final,
+  weight.reduction  = merged[["lsi"]],
+  dims              = 2:30
+)
+
+merged <- AddMetaData(merged, metadata = predicted.labels)
+
+pdf(file.path(FIGURES_DIR, "dimplot_predicted_labels.pdf"), width = 8, height = 6)
+DimPlot(merged, group.by = "predicted.id")
+dev.off()
+
+pdf(file.path(FIGURES_DIR, "dimplot_cell_type.pdf"), width = 8, height = 6)
+DimPlot(merged, group.by = "cell_type")
+dev.off()
+
+saveRDS(merged, file.path(RDS_DIR, "atac_after_prediction.rds"))
+
+# ── 5. Peak calling per cell type (macs3) ─────────────────────────────────────
+DefaultAssay(merged) <- "peaks"
+
+peaks <- CallPeaks(
+  object       = merged,
+  group.by     = "cell_type",
+  macs2.path   = MACS3_PATH,
+  combine.peaks = TRUE
+)
+
+# Filter to standard chromosomes
+standard_chroms <- paste0("chr", c(1:19, "X", "Y"))
+peaks_filtered <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks_filtered <- subset(peaks_filtered, seqnames %in% standard_chroms)
+
+# Create new assay with called peaks
+peak_counts <- FeatureMatrix(
+  fragments = Fragments(merged),
+  features  = peaks,
+  cells     = colnames(merged)
+)
+
+peak_assay <- CreateChromatinAssay(
+  counts    = peak_counts,
+  ranges    = peaks,
+  genome    = "mm10",
+  fragments = Fragments(merged)
+)
+
+merged[["called_peaks"]] <- peak_assay
+DefaultAssay(merged) <- "called_peaks"
+
+# Add region statistics
+merged <- RegionStats(
+  object   = merged,
+  genome   = BSgenome.Mmusculus.UCSC.mm10,
+  annotation = annotations
+)
+
+# Update peak-level metadata
+merged$nCount_called_peaks  <- colSums(merged@assays$called_peaks@counts)
+merged$nFeature_called_peaks <- colSums(merged@assays$called_peaks@counts > 0)
+
+# Re-run dimensionality reduction on called peaks
+merged <- RunTFIDF(merged)
+merged <- FindTopFeatures(merged, min.cutoff = "q0")
+merged <- RunSVD(merged)
+merged <- RunUMAP(merged, reduction = "lsi", dims = 2:30)
+merged <- FindNeighbors(merged, reduction = "lsi", dims = 2:30)
+atac_wpeaks <- FindClusters(merged, resolution = 0.2)
+
+pdf(file.path(FIGURES_DIR, "dimplot_called_peaks_predicted.pdf"), width = 8, height = 6)
+DimPlot(atac_wpeaks, reduction = "umap", group.by = "predicted.id")
+dev.off()
+
+pdf(file.path(FIGURES_DIR, "dimplot_called_peaks_cell_type.pdf"), width = 8, height = 6)
+DimPlot(atac_wpeaks, group.by = "cell_type")
+dev.off()
+
+# Restore UCSC-style seqlevels for plotting
+seqlevelsStyle(annotations) <- "UCSC"
+Annotation(atac_wpeaks) <- annotations
+
+saveRDS(atac_wpeaks, file.path(RDS_DIR, "atac_called_peaks.rds"))
+
+# ── 6. Gene activities from called peaks ──────────────────────────────────────
+DefaultAssay(atac_wpeaks) <- "called_peaks"
+
+gene.activities <- GeneActivity(
+  object           = atac_wpeaks,
+  assay            = "called_peaks",
+  extend.upstream  = 2000,
+  extend.downstream = 0
+)
+
+atac_wpeaks[["RNA_called_peaks"]] <- CreateAssayObject(counts = gene.activities)
+
+atac_wpeaks <- NormalizeData(
+  object               = atac_wpeaks,
+  assay                = "RNA_called_peaks",
+  normalization.method = "LogNormalize",
+  scale.factor         = median(atac_wpeaks$nCount_called_peaks)
+)
+
+# Final metadata annotation (as original)
+atac_wpeaks@meta.data <- atac_wpeaks@meta.data %>%
+  mutate(
+    annotation = case_when(
+      cell_type %in% c("hscCAM")         ~ "CAM",
+      cell_type %in% c("repop_ysCAM")    ~ "CAM",
+      cell_type %in% c("hom_ysCAM")      ~ "CAM",
+      cell_type %in% c("hscDM")          ~ "DM",
+      cell_type %in% c("repopDM")        ~ "DM",
+      cell_type %in% c("homDM")          ~ "DM",
+      cell_type %in% c("repopMG")        ~ "MG",
+      cell_type %in% c("homMG")          ~ "MG",
+      cell_type %in% c("clMonocyte")     ~ "Mono",
+      TRUE                               ~ "Unclassified"
+    )
+  )
+
+atac_wpeaks <- ScaleData(atac_wpeaks, assay = "RNA_called_peaks")
+
+# Delete outdated assays
+atac_wpeaks@assays$ATAC <- NULL
+atac_wpeaks@assays$RNA <- NULL
+atac_wpeaks@assays$peaks <- NULL
+
+saveRDS(atac_wpeaks, file.path(RDS_DIR, "atac_called_peaks_and_RNA_Assay.rds"))
+
+cat("Final object saved:", file.path(RDS_DIR, "atac_called_peaks_and_RNA_Assay.rds"), "\n")
+cat("Final cells:", ncol(atac_wpeaks), "| Assays:", names(atac_wpeaks@assays), "\n")
