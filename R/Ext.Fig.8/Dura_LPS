@@ -1,0 +1,436 @@
+# =============================================================================
+# Project:   Bulk RNA-seq – LPS treatment in Ccr2-creERT2 × tdT model (Dura focus)
+# Script:    bulkRNAseq_LPS_Ccr2_Dura_analysis.R
+# Author:    Maximilian Fliegauf
+# Date:      08/2025
+# Purpose:   Load Dura counts & metadata → QC → gene filtering (ribosomal/mito/
+#            pseudo/patterns) → DESeq2 analysis (full Dura + pos vs neg LPS/CTL)
+#            → volcano plots → DEG heatmap → GO enrichment → radar plot of LPS
+#            signature genes.
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(writexl)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggrepel)
+  library(apeglm)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(AnnotationDbi)
+  library(msigdbr)
+  library(EnhancedVolcano)
+  library(biomaRt)
+  library(fmsb)          # ggradar
+  library(scales)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/bulkRNAseq_LPS_Ccr2_Dura_analysis.R")
+
+COUNTS_FILE   <- here("data/raw/counts_second_data.txt")
+COL_DATA_FILE <- here("data/raw/colData_second_data.txt")
+
+TABLES_DIR  <- here("results/tables/bulkRNAseq_dura")
+FIGURES_DIR <- here("results/figures/bulkRNAseq_dura")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load Dura counts & metadata ───────────────────────────────────────────
+counts_dura <- read.table(COUNTS_FILE, header = TRUE, row.names = 1, sep = "\t")
+colData_dura <- read.table(COL_DATA_FILE, header = TRUE, sep = "\t")
+
+colnames(counts_dura) <- colData_dura$Sample
+
+# Create combined factors
+colData_dura <- colData_dura %>%
+  mutate(
+    Treatment = "BLZ",
+    combined  = factor(paste0(Treatment, "_", Condition)),
+    combined1 = factor(paste0(cell_type, "_", combined))
+  )
+
+# ── 2. Subset to D_pos / D_neg only ──────────────────────────────────────────
+colData_dura_filtered <- colData_dura %>%
+  filter(cell_type %in% c("D_pos", "D_neg"))
+
+colData_dura_filtered$combined1 <- droplevels(colData_dura_filtered$combined1)
+
+counts_dura_filtered <- counts_dura[, colData_dura_filtered$Sample]
+
+# Sanity check
+stopifnot(all(colnames(counts_dura_filtered) == colData_dura_filtered$Sample))
+
+# ── 3. Quality Control ───────────────────────────────────────────────────────
+total_counts <- colSums(counts_dura_filtered)
+summary(total_counts)
+
+pdf(file.path(FIGURES_DIR, "library_sizes_dura.pdf"), width = 10, height = 6)
+barplot(total_counts, main = "Library Sizes Smart-3 Seq Ccr2creERT2×tdT LPS (Dura)",
+        col = "lightblue", las = 2, cex.names = 0.7)
+dev.off()
+
+# Filter low-expressed genes (≥10 counts in ≥ half of samples)
+counts_dura_filtered <- counts_dura_filtered[rowSums(counts_dura_filtered > 10) >= ncol(counts_dura_filtered)/2, ]
+detected_genes <- counts_dura[rowSums(counts_dura > 1) >= 1, ]
+
+cat("Genes after low-count filter:", nrow(counts_dura_filtered), "\n")
+
+# ── 4. Gene filtering (ribosomal, mitochondrial, pseudogenes, patterns) ───────
+ribosomal_genes <- msigdbr(species = "Mus musculus", category = "C2") %>%
+  filter(gs_name == "KEGG_RIBOSOME") %>% pull(gene_symbol)
+
+mitochondrial_genes <- msigdbr(species = "Mus musculus", category = "C2") %>%
+  filter(gs_name == "KEGG_OXIDATIVE_PHOSPHORYLATION") %>% pull(gene_symbol)
+
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl", host = "https://www.ensembl.org")
+
+pseudogenes <- getBM(attributes = c("external_gene_name"),
+                     filters = "biotype",
+                     values = c("pseudogene", "predicted", "novel", "uncharacterized"),
+                     mart = mart) %>% pull(external_gene_name)
+
+non_coding_genes <- getBM(attributes = c("external_gene_name"),
+                          filters = "biotype",
+                          values = c("lincRNA", "miRNA", "snRNA", "snoRNA"),
+                          mart = mart) %>% pull(external_gene_name)
+
+ex_genes <- unique(c(ribosomal_genes, mitochondrial_genes, pseudogenes, non_coding_genes))
+
+ex_genes <- trimws(ex_genes)
+
+counts_dura_filtered <- counts_dura_filtered[!rownames(counts_dura_filtered) %in% ex_genes, ]
+
+cat("Genes excluded (ribo/mito/pseudo/noncoding):", length(ex_genes), "\n")
+cat("Remaining genes:", nrow(counts_dura_filtered), "\n")
+
+# Pattern-based exclusion
+patterns <- c("Mrp", "Rpl", "Rps", "Sn", "Sf", "Gtf", "Med", "Rbm", "Rik",
+              "Lsm", "Eif", "Atp", "Nduf", "Tomm", "Pol", "Anap", "Rna", "Gm", "Ddx",
+              "Smim", "Zfp", "Bola", "Dna", "Timm", "Micos")
+
+ex_genes_pattern <- grep(paste(patterns, collapse = "|"), rownames(counts_dura_filtered), value = TRUE)
+
+counts_dura_filtered <- counts_dura_filtered[!rownames(counts_dura_filtered) %in% ex_genes_pattern, ]
+
+cat("Remaining genes after pattern exclusion:", nrow(counts_dura_filtered), "\n")
+
+# ── 5. DESeq2 – Full Dura dataset ────────────────────────────────────────────
+design_formula <- ~ combined + cell_type
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_dura_filtered,
+  colData   = colData_dura_filtered,
+  design    = design_formula
+)
+
+dds <- estimateSizeFactors(dds)
+dds <- DESeq(dds)
+
+# VST for visualization
+vsd <- vst(dds, blind = TRUE)
+vsd_mat <- assay(vsd)
+
+# ── 6. PCA Plot ──────────────────────────────────────────────────────────────
+pca_data <- plotPCA(vsd, intgroup = c("cell_type", "combined"), returnData = TRUE, ntop = 100)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+p_pca <- ggplot(pca_data, aes(PC1, PC2, color = cell_type, shape = combined)) +
+  geom_point(size = 5, stroke = 1) +
+  scale_color_manual(values = c("D_pos" = "#FF994E", "D_neg" = "#B66DFF")) +
+  xlab(paste0("PC1: ", percent_var[1], "% variance")) +
+  ylab(paste0("PC2: ", percent_var[2], "% variance")) +
+  labs(title = "PCA of RNA-seq Data (Dura)") +
+  guides(color = guide_legend(override.aes = list(shape = c(16)))) +
+  guides(shape = guide_legend(override.aes = list(shape = c(16, 17)))) +
+  theme_minimal()
+
+ggsave(file.path(FIGURES_DIR, "pca_dura.pdf"), p_pca, width = 8, height = 6)
+
+# ── 7. Unbiased Heatmap – Top 500 most variable genes ─────────────────────────
+gene_variances <- apply(vsd_mat, 1, var)
+top_variable_genes <- order(gene_variances, decreasing = TRUE)[1:500]
+vsd_mat_top <- vsd_mat[top_variable_genes, ]
+
+annotation_col <- as.data.frame(colData_dura_filtered[, c("combined", "cell_type"), drop = FALSE])
+rownames(annotation_col) <- colData_dura_filtered$Sample
+
+annotation_colors <- list(
+  cell_type = c("D_pos" = "#FF994E", "D_neg" = "#B66DFF"),
+  combined  = c("BLZ_LPS" = "#808080", "BLZ_CTL" = "#D3D3D3")
+)
+
+pheatmap(
+  vsd_mat_top,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize = 8,
+  fontsize_row = 3,
+  fontsize_col = 8,
+  annotation_col = annotation_col,
+  annotation_colors = annotation_colors,
+  border_color = NA,
+  main = "Top 500 Most Variable Genes (VST) – Dura",
+  filename = file.path(FIGURES_DIR, "heatmap_top500_variable_genes_dura.pdf")
+)
+
+# ── 8. LPS activation contrasts (D_neg LPS vs CTL, D_pos LPS vs CTL) ──────────
+design_formula_lps <- ~ combined1
+
+dds_lps <- DESeqDataSetFromMatrix(
+  countData = counts_dura_filtered,
+  colData   = colData_dura_filtered,
+  design    = design_formula_lps
+)
+
+dds_lps <- estimateSizeFactors(dds_lps)
+dds_lps <- DESeq(dds_lps)
+
+# D_neg LPS vs CTL
+lfc_shrink_dn <- lfcShrink(dds_lps, coef = "combined1_D_neg_BLZ_LPS_vs_D_neg_BLZ_CTL", type = "apeglm")
+
+p_volc_dn <- EnhancedVolcano(
+  lfc_shrink_dn,
+  lab = rownames(lfc_shrink_dn),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "Dura neg: LPS vs CTL",
+  max.overlaps = 200, labSize = 1
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_dura_neg_LPS_vs_CTL.pdf"), p_volc_dn, width = 8, height = 6)
+
+dn_LPS <- lfc_shrink_dn
+
+# D_pos LPS vs CTL
+dds_lps$combined1 <- relevel(dds_lps$combined1, ref = "D_pos_BLZ_CTL")
+dds_lps <- nbinomWaldTest(dds_lps)
+lfc_shrink_dp <- lfcShrink(dds_lps, coef = "combined1_D_pos_BLZ_LPS_vs_D_pos_BLZ_CTL", type = "apeglm")
+
+p_volc_dp <- EnhancedVolcano(
+  lfc_shrink_dp,
+  lab = rownames(lfc_shrink_dp),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "Dura pos: LPS vs CTL",
+  max.overlaps = 200, labSize = 1
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_dura_pos_LPS_vs_CTL.pdf"), p_volc_dp, width = 8, height = 6)
+
+dp_LPS <- lfc_shrink_dp
+
+# D_pos vs D_neg LPS
+dds_lps$combined1 <- relevel(dds_lps$combined1, ref = "D_neg_BLZ_LPS")
+dds_lps <- nbinomWaldTest(dds_lps)
+lfc_shrink_neg_vs_pos <- lfcShrink(dds_lps, coef = "combined1_D_pos_BLZ_LPS_vs_D_neg_BLZ_LPS", type = "apeglm")
+
+p_volc_neg_vs_pos <- EnhancedVolcano(
+  lfc_shrink_neg_vs_pos,
+  lab = rownames(lfc_shrink_neg_vs_pos),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "Dural CAMs LPS: pos vs neg",
+  drawConnectors = FALSE,
+  max.overlaps = 200, labSize = 1
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_dura_pos_vs_neg_LPS.pdf"), p_volc_neg_vs_pos, width = 8, height = 6)
+
+LPS_neg_vs_pos <- lfc_shrink_neg_vs_pos
+
+# ── 9. CTL-only analysis (D_pos vs D_neg) ─────────────────────────────────────
+colData_CAM_CTL <- colData_dura_filtered[colData_dura_filtered$Condition == "CTL", ]
+count_filt_CAM_CTL <- counts_dura_filtered[, colnames(counts_dura_filtered) %in% colData_CAM_CTL$Sample]
+
+design_formula_CTL <- ~ cell_type
+
+dds_CAM_CTL <- DESeqDataSetFromMatrix(
+  countData = count_filt_CAM_CTL,
+  colData   = colData_CAM_CTL,
+  design    = design_formula_CTL
+)
+
+dds_CAM_CTL <- estimateSizeFactors(dds_CAM_CTL)
+dds_CAM_CTL <- DESeq(dds_CAM_CTL)
+
+dds_CAM_CTL$cell_type <- relevel(dds_CAM_CTL$cell_type, ref = "D_neg")
+dds_CAM_CTL <- nbinomWaldTest(dds_CAM_CTL)
+
+results_CTL <- results(dds_CAM_CTL, name = "cell_type_D_pos_vs_D_neg")
+lfc_shrink_neg_vs_pos_CTL <- lfcShrink(dds_CAM_CTL, coef = "cell_type_D_pos_vs_D_neg", type = "apeglm")
+
+p_volc_CTL <- EnhancedVolcano(
+  lfc_shrink_neg_vs_pos_CTL,
+  lab = rownames(lfc_shrink_neg_vs_pos_CTL),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "CAMs CTL: pos vs neg",
+  max.overlaps = 100, labSize = 3
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_dura_pos_vs_neg_CTL.pdf"), p_volc_CTL, width = 8, height = 6)
+
+CAM_CTL_neg_vs_pos <- lfc_shrink_neg_vs_pos_CTL
+
+# ── 10. DEG Heatmap (top genes from each contrast) ────────────────────────────
+neg_LPS_heat <- dn_LPS[!is.na(dn_LPS$padj) & !is.na(dn_LPS$log2FoldChange), ]
+pos_LPS_heat <- dp_LPS[!is.na(dp_LPS$padj) & !is.na(dp_LPS$log2FoldChange), ]
+neg_pos_LPS_heat <- LPS_neg_vs_pos[!is.na(LPS_neg_vs_pos$padj) & !is.na(LPS_neg_vs_pos$log2FoldChange), ]
+neg_pos_CTL_heat <- CAM_CTL_neg_vs_pos[!is.na(CAM_CTL_neg_vs_pos$padj) & !is.na(CAM_CTL_neg_vs_pos$log2FoldChange), ]
+
+neg_LPS_heat <- neg_LPS_heat[neg_LPS_heat$padj < 0.05 & abs(neg_LPS_heat$log2FoldChange) > 0.59, ]
+pos_LPS_heat <- pos_LPS_heat[pos_LPS_heat$padj < 0.05 & abs(pos_LPS_heat$log2FoldChange) > 0.59, ]
+neg_pos_LPS_heat <- neg_pos_LPS_heat[neg_pos_LPS_heat$padj < 0.05 & abs(neg_pos_LPS_heat$log2FoldChange) > 0.59, ]
+neg_pos_CTL_heat <- neg_pos_CTL_heat[neg_pos_CTL_heat$padj < 0.05 & abs(neg_pos_CTL_heat$log2FoldChange) > 0.59, ]
+
+neg_LPS_heat_top <- neg_LPS_heat[order(neg_LPS_heat$padj), ][1:300, ]
+pos_LPS_heat_top <- pos_LPS_heat[order(pos_LPS_heat$padj), ][1:300, ]
+neg_pos_LPS_heat_top <- neg_pos_LPS_heat[order(neg_pos_LPS_heat$padj), ][1:15, ]
+neg_pos_CTL_heat_top <- neg_pos_CTL_heat[order(neg_pos_CTL_heat$padj), ][1:100, ]
+
+genes_1 <- rownames(neg_LPS_heat_top)
+genes_2 <- rownames(pos_LPS_heat_top)
+genes_3 <- rownames(neg_pos_LPS_heat_top)
+genes_4 <- rownames(neg_pos_CTL_heat_top)
+
+genes <- union(genes_1, genes_2)
+genes <- union(genes, genes_3)
+genes <- union(genes, genes_4)
+
+dds_mat <- counts(dds, normalized = TRUE)
+mat <- dds_mat[rownames(dds_mat) %in% genes, ]
+
+mat_df <- as.data.frame(mat)
+transposed_mat <- t(mat_df)
+scaled_mat <- scale(transposed_mat, center = TRUE, scale = TRUE)
+scaled_mat <- t(scaled_mat)
+
+annotation_col <- as.data.frame(colData_dura_filtered[, c("combined", "cell_type"), drop = FALSE])
+rownames(annotation_col) <- colData_dura_filtered$Sample
+
+annotation_colors <- list(
+  cell_type = c("D_pos" = "#FF994E", "D_neg" = "#B66DFF"),
+  combined  = c("BLZ_LPS" = "#808080", "BLZ_CTL" = "#D3D3D3")
+)
+
+pheatmap(
+  scaled_mat,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize = 8,
+  fontsize_row = 3,
+  fontsize_col = 8,
+  annotation_col = annotation_col,
+  annotation_colors = annotation_colors,
+  border_color = NA,
+  main = "DEG Heatmap – Dura",
+  filename = file.path(FIGURES_DIR, "heatmap_DEG_dura.pdf")
+)
+
+# ── 11. GO enrichment (LPS vs CTL) ────────────────────────────────────────────
+background_genes <- rownames(detected_genes)
+org_db <- org.Mm.eg.db
+
+# D_neg LPS vs CTL (upregulated)
+dn_LPS_up <- dn_LPS[!is.na(dn_LPS$padj) & dn_LPS$padj < 0.05 & dn_LPS$log2FoldChange > 0, ]
+sign_dn_LPS <- rownames(dn_LPS_up)
+
+enrichGO_result_dn_LPS <- enrichGO(
+  gene = sign_dn_LPS,
+  OrgDb = org.Mm.eg.db,
+  universe = background_genes,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.2,
+  qvalueCutoff = 0.05,
+  minGSSize = 3,
+  keyType = "SYMBOL"
+)
+
+ego_dn_LPS <- simplify(enrichGO_result_dn_LPS, cutoff = 0.6, by = "p.adjust", measure = "Wang")
+
+pdf(file.path(FIGURES_DIR, "GO_LPS_dura_neg.pdf"), width = 10, height = 6)
+barplot(ego_dn_LPS, showCategory = 10, title = "GO LPS dura neg") +
+  scale_fill_gradient(low = "#B66DFF", high = "white") +
+  theme_minimal() +
+  geom_bar(stat = "identity", color = "black")
+dev.off()
+
+# D_pos LPS vs CTL (upregulated)
+dp_LPS_up <- dp_LPS[!is.na(dp_LPS$padj) & dp_LPS$padj < 0.05 & dp_LPS$log2FoldChange > 1, ]
+sign_dp_LPS <- rownames(dp_LPS_up)
+
+enrichGO_result_dp_LPS <- enrichGO(
+  gene = sign_dp_LPS,
+  OrgDb = org.Mm.eg.db,
+  universe = background_genes,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.2,
+  qvalueCutoff = 0.05,
+  minGSSize = 3,
+  keyType = "SYMBOL"
+)
+
+ego_dp_LPS <- simplify(enrichGO_result_dp_LPS, cutoff = 0.6, by = "p.adjust", measure = "Wang")
+
+pdf(file.path(FIGURES_DIR, "GO_LPS_dura_pos.pdf"), width = 10, height = 6)
+barplot(ego_dp_LPS, showCategory = 10, title = "GO LPS pos") +
+  scale_fill_gradient(low = "#FF994E", high = "white") +
+  theme_minimal() +
+  geom_bar(stat = "identity", color = "black")
+dev.off()
+
+# ── 12. Common LPS response radar plot ────────────────────────────────────────
+normalized_counts <- counts(dds, normalized = TRUE)
+
+lps_genes <- c(
+  "Spp1", "Tnfaip3", "Nfkbiz", "Hdac4", "Gadd45b", "Il6",
+  "Ccl3", "Ccl9", "Fkbp5", "Fpr1", "Id2",
+  "Il15ra", "Il1rn", "Itga5", "C3", "Itgal",
+  "Mmp19", "Msrb1", "Ms4a6d", "Nfkbia", "Csf3", "Ikbke", "Mmp14",
+  "Lcn2", "Ccl5", "Ccl17", "Cxcl13", "Mt1", "Saa3",
+  "Hacd4", "Il16", "Trem2", "Tgfbr2", "Slc9a9", "Tln2",
+  "Mgl2", "Gas6", "Csf1r"
+)
+
+sel_counts <- normalized_counts[lps_genes[lps_genes %in% rownames(normalized_counts)], , drop = FALSE]
+
+mean_expression <- sapply(unique(colData_dura_filtered$combined1), function(cond) {
+  samples <- colData_dura_filtered$Sample[colData_dura_filtered$combined1 == cond]
+  rowMeans(sel_counts[, samples, drop = FALSE])
+})
+
+mean_df <- as.data.frame(t(mean_expression))
+mean_df$Group <- rownames(mean_df)
+
+ggradar_genes_rescaled <- mean_df %>%
+  as_tibble() %>%
+  mutate(across(-Group, ~ log10(. + 1))) %>%
+  rename(group = Group)
+
+ggradar(
+  ggradar_genes_rescaled,
+  values.radar = c(0, 10^3, 10^7),
+  group.point.size = 2,
+  grid.mid = 3,
+  grid.max = 7,
+  group.line.width = 1,
+  group.colours = c("#AB47BC", "#B66DFF", "#FFBD31", "#FF994E"),
+  legend.text.size = 10
+)
+
+ggsave(file.path(FIGURES_DIR, "radar_common_LPS_response_dura.pdf"), width = 10, height = 8)
