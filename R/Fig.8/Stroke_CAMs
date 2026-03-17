@@ -517,4 +517,3 @@ write.table(mean_counts, file.path(TABLES_DIR, "mean_counts_stroke_cams.txt"), s
 
 cat("Mean counts table exported to:", file.path(TABLES_DIR, "mean_counts_stroke_cams.txt"), "\n")
 
-sessionInfo()
