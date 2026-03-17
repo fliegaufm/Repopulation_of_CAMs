@@ -1,1 +1,341 @@
 
+# =============================================================================
+# Project:   scATAC-seq – CAM repopulation in Mrc1CreERT2 R26tdT model
+# Script:    scATACseq_CAM_Repop_qc.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Load 10× scATAC-seq samples → create Seurat objects → QC (TSS, 
+#            nucleosome signal, peak counts, doublets via scDblFinder) → filter 
+#            low-quality cells → unify peaks → merge → re-run LSI/UMAP → manual 
+#            doublet/trash removal → final clustering → metadata annotation 
+#            (treatment, sort gate, origin, cell type) → save final object.
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Signac)
+  library(GenomeInfoDb)
+  library(EnsDb.Mmusculus.v79)
+  library(GenomicRanges)
+  library(dplyr)
+  library(ggplot2)
+  library(JASPAR2020)
+  library(TFBSTools)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  library(biovizBase)
+  library(reticulate)
+  library(scDblFinder)
+  library(Seurat)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/scATACseq_CAM_Repop_qc.R")
+
+DATA_DIR    <- here("data/raw/scATAC_samples")
+OUTPUT_DIR  <- here("results")
+FIGURES_DIR <- here("results/figures/scATAC_CAM")
+RDS_DIR     <- here("results/objects")
+
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(RDS_DIR,     recursive = TRUE, showWarnings = FALSE)
+
+# Define sample prefixes (as in original)
+samples <- c(
+  "20250818_01_FRA_scATAC_MGVandBLV",
+  "20250818_02_FRA_scATAC_MGBandBLB",
+  "20250818_03_FRA_scATAC_DV_plus",
+  "20250818_04_FRA_scATAC_DB_minus",
+  "20250818_05_FRA_scATAC_DB_plus",
+  "20250818_06_FRA_scATAC_CV_plus",
+  "20250818_07_FRA_scATAC_CB_minus",
+  "20250818_07_FRA_scATAC_CB_plus"
+)
+
+# Canonical chromosomes for mm10
+canonical_chroms <- c(paste0("chr", 1:19), "chrX", "chrY")
+
+# ── 1. Load & process each sample individually ────────────────────────────────
+seurat_list <- list()
+
+for (sample in samples) {
+  cat("Processing sample:", sample, "\n")
+  
+  # File paths
+  h5_file       <- file.path(DATA_DIR, sample, "outs", "filtered_peak_bc_matrix.h5")
+  fragment_file <- file.path(DATA_DIR, sample, "outs", "fragments.tsv.gz")
+  
+  # Load peak-barcode matrix
+  counts <- Read10X_h5(h5_file)
+  
+  # Filter to canonical chromosomes
+  peaks <- rownames(counts)
+  chroms <- sub(":.*", "", peaks)
+  keep_peaks <- chroms %in% canonical_chroms
+  counts <- counts[keep_peaks, ]
+  
+  # Create ChromatinAssay
+  chromatin_assay <- CreateChromatinAssay(
+    counts        = counts,
+    sep           = c(":", "-"),
+    genome        = "mm10",
+    fragments     = fragment_file,
+    min.cells     = 10,
+    min.features  = 200,
+    validate.fragments = TRUE
+  )
+  
+  # Create Seurat object
+  seurat_obj <- CreateSeuratObject(
+    counts = chromatin_assay,
+    assay  = "ATAC"
+  )
+  
+  # Add gene annotations
+  annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+  seqlevels(annotations) <- paste0("chr", seqlevels(annotations))
+  genome(annotations) <- "mm10"
+  Annotation(seurat_obj) <- annotations
+  
+  # Compute QC metrics
+  seurat_obj <- NucleosomeSignal(seurat_obj)
+  seurat_obj <- TSSEnrichment(seurat_obj)
+  
+  # Add sample metadata
+  seurat_obj$sample <- sample
+  
+  # Generate QC plots
+  pdf(file.path(FIGURES_DIR, paste0(sample, "_QC_plots.pdf")), width = 12, height = 8)
+  print(VlnPlot(
+    seurat_obj,
+    features = c("pct_reads_in_peaks", "peak_region_fragments", "TSS.enrichment",
+                 "nCount_ATAC", "nFeature_ATAC", "nucleosome_signal"),
+    pt.size = 0.1, ncol = 3
+  ))
+  print(VlnPlot(seurat_obj, features = "nCount_ATAC"))
+  print(DensityScatter(
+    seurat_obj,
+    x = "nCount_ATAC", y = "TSS.enrichment",
+    log_x = TRUE, quantiles = TRUE
+  ))
+  dev.off()
+  
+  # Store object
+  seurat_list[[sample]] <- seurat_obj
+  
+  cat("  → Done. Cells:", ncol(seurat_obj), "| Peaks:", nrow(seurat_obj), "\n")
+}
+
+# ── 2. Doublet detection (scDblFinder) ───────────────────────────────────────
+sce_list <- lapply(seurat_list, function(obj) {
+  as.SingleCellExperiment(obj, assay = "ATAC")
+})
+
+sce_list <- lapply(sce_list, function(sce) {
+  scDblFinder(sce, nfeatures = 25, aggregateFeatures = TRUE)
+})
+
+for (i in seq_along(seurat_list)) {
+  sample_name <- names(seurat_list)[i]
+  seurat_list[[sample_name]]$doublet_score <- colData(sce_list[[i]])$scDblFinder.score
+  seurat_list[[sample_name]]$doublet_class <- colData(sce_list[[i]])$scDblFinder.class
+}
+
+# Plot doublet scores
+pdf(file.path(FIGURES_DIR, "doublet_scores_per_sample.pdf"), width = 12, height = 10)
+lapply(names(seurat_list), function(s) {
+  VlnPlot(seurat_list[[s]], "doublet_score", group.by = "doublet_class", pt.size = 0.1) +
+    ggtitle(s)
+})
+dev.off()
+
+# ── 3. Per-sample peak filtering (min cells) ─────────────────────────────────
+min_cells_per_peak <- 15  # as used in original
+
+for (sample in names(seurat_list)) {
+  peak_counts <- rowSums(GetAssayData(seurat_list[[sample]], assay = "ATAC", slot = "counts") > 0)
+  keep_peaks  <- names(peak_counts)[peak_counts >= min_cells_per_peak]
+  seurat_list[[sample]] <- seurat_list[[sample]][keep_peaks, ]
+  cat(sample, "→ kept peaks:", length(keep_peaks), "\n")
+}
+
+# ── 4. Per-sample cell filtering ─────────────────────────────────────────────
+# Different TSS thresholds per sample (as in original)
+seurat_list[["20250818_01_FRA_scATAC_MGVandBLV"]] <- subset(
+  seurat_list[["20250818_01_FRA_scATAC_MGVandBLV"]],
+  subset = nucleosome_signal < 3 & TSS.enrichment > 4 & nCount_ATAC > 10000
+)
+
+seurat_list[["20250818_02_FRA_scATAC_MGBandBLB"]] <- subset(
+  seurat_list[["20250818_02_FRA_scATAC_MGBandBLB"]],
+  subset = nucleosome_signal < 3 & TSS.enrichment > 4 & nCount_ATAC > 10000
+)
+
+for (s in samples[3:8]) {
+  seurat_list[[s]] <- subset(
+    seurat_list[[s]],
+    subset = nucleosome_signal < 3 & TSS.enrichment > 2.5 & nCount_ATAC > 10000
+  )
+}
+
+# Save QC-filtered objects
+for (sample in names(seurat_list)) {
+  saveRDS(seurat_list[[sample]], file.path(RDS_DIR, paste0(sample, "_after_qc.rds")))
+}
+
+# ── 5. Re-load filtered objects (optional step) ──────────────────────────────
+# Uncomment if restarting from saved QC objects
+# seurat_list <- lapply(samples, function(s) readRDS(file.path(RDS_DIR, paste0(s, "_after_qc.rds"))))
+# names(seurat_list) <- samples
+
+# ── 6. Peak unification & merging ─────────────────────────────────────────────
+combined.peaks <- UnifyPeaks(object.list = seurat_list, mode = "reduce")
+
+# Re-create peak assays with unified peaks
+for (i in seq_along(seurat_list)) {
+  counts <- FeatureMatrix(
+    fragments = Fragments(seurat_list[[i]]),
+    features = combined.peaks,
+    cells    = colnames(seurat_list[[i]])
+  )
+  
+  seurat_list[[i]][["peaks"]] <- CreateChromatinAssay(
+    counts    = counts,
+    fragments = Fragments(seurat_list[[i]])
+  )
+}
+
+# Merge all objects
+merged <- merge(
+  x = seurat_list[[1]],
+  y = seurat_list[2:length(seurat_list)]
+)
+
+DefaultAssay(merged) <- "peaks"
+
+# Run dimensionality reduction
+merged <- RunTFIDF(merged)
+merged <- FindTopFeatures(merged, min.cutoff = 20)
+merged <- RunSVD(merged, reduction.key = "LSI_", reduction.name = "lsi")
+merged <- RunUMAP(merged, dims = 2:30, reduction = "lsi")
+
+pdf(file.path(FIGURES_DIR, "UMAP_merged_by_sample.pdf"), width = 8, height = 6)
+DimPlot(merged, group.by = "sample", pt.size = 0.1)
+dev.off()
+
+# ── 7. Additional manual QC (interactive doublet/trash removal) ───────────────
+pdf(file.path(FIGURES_DIR, "UMAP_doublet_class.pdf"), width = 8, height = 6)
+DimPlot(merged, group.by = "doublet_class", alpha = 0.4)
+dev.off()
+
+# Initialize manual doublet column
+merged$manual_doublets <- "singlets"
+
+# Interactive selection (run interactively; saved selections can be re-applied)
+# Example:
+# p1 <- DimPlot(merged, reduction = "umap", label = TRUE) + ggtitle("Select Trash Cells - Iteration 1")
+# selected_cells <- CellSelector(plot = p1)
+# Run FindMarkers function on the selected cell IDs
+# merged$manual_doublets[colnames(merged) %in% selected_cells] <- "doublets"
+
+# After manual selection:
+pdf(file.path(FIGURES_DIR, "UMAP_manual_doublets.pdf"), width = 8, height = 6)
+DimPlot(merged, group.by = "manual_doublets")
+dev.off()
+
+# Subset to singlets only
+merged <- subset(merged, manual_doublets == "singlets")
+
+# Re-run reductions after filtering
+merged <- RunTFIDF(merged)
+merged <- FindTopFeatures(merged, min.cutoff = 20)
+merged <- RunSVD(merged, reduction.key = "LSI_", reduction.name = "lsi")
+merged <- RunUMAP(merged, dims = 2:30, reduction = "lsi")
+merged <- FindNeighbors(merged, reduction = "lsi", dims = 2:30)
+merged <- FindClusters(merged, resolution = 0.2)
+
+pdf(file.path(FIGURES_DIR, "UMAP_final_by_sample.pdf"), width = 8, height = 6)
+DimPlot(merged, group.by = "sample", pt.size = 0.1)
+dev.off()
+
+pdf(file.path(FIGURES_DIR, "UMAP_final_clusters.pdf"), width = 8, height = 6)
+DimPlot(merged, group.by = "seurat_clusters", pt.size = 0.1)
+dev.off()
+
+# ── 8. Add metadata (treatment, sort gate, origin, cell type) ─────────────────
+merged <- merged %>%
+  AddMetaData(metadata = case_when(
+    .$sample %in% c("CB_minus", "CB_plus", "DB_minus", "DB_plus", "MGBandBLB") ~ "BLZ",
+    .$sample %in% c("CV_plus", "DV_plus", "MGVandBLV") ~ "V",
+    TRUE ~ "Unknown"
+  ), col.name = "treatment")
+
+merged <- merged %>%
+  AddMetaData(metadata = case_when(
+    .$sample %in% c("CB_minus", "DB_minus") ~ "tdT-",
+    .$sample %in% c("CB_plus", "CV_plus", "DB_plus", "DV_plus") ~ "tdT+",
+    .$sample %in% c("MGBandBLB", "MGVandBLV") ~ "MG+Mono",
+    TRUE ~ "Unknown"
+  ), col.name = "sort_gate")
+
+merged <- merged %>%
+  AddMetaData(metadata = case_when(
+    .$seurat_clusters %in% c(0) ~ "YS/HSC",
+    .$seurat_clusters %in% c(1) ~ "YS",
+    .$seurat_clusters %in% c(2) ~ "HSC",
+    .$seurat_clusters %in% c(3) ~ "YS",
+    .$seurat_clusters %in% c(4) ~ "YS",
+    .$seurat_clusters %in% c(5) ~ "HSC",
+    TRUE ~ "Unclassified"
+  ), col.name = "origin")
+
+merged <- merged %>%
+  AddMetaData(metadata = case_when(
+    .$sample %in% c("CB_minus") & .$seurat_clusters %in% c(2, 4) ~ "hscCAM",
+    .$sample %in% c("CB_plus") & .$seurat_clusters %in% c(2, 4) ~ "repop_ysCAM",
+    .$sample %in% c("CV_plus") & .$seurat_clusters %in% c(2, 4) ~ "hom_ysCAM",
+    .$sample %in% c("DB_minus") & .$seurat_clusters %in% c(0) ~ "hscDM",
+    .$sample %in% c("DB_plus") & .$seurat_clusters %in% c(0) ~ "repopDM",
+    .$sample %in% c("DV_plus") & .$seurat_clusters %in% c(0) ~ "homDM",
+    .$sample %in% c("MGBandBLB") & .$seurat_clusters %in% c(1, 3) ~ "repopMG",
+    .$sample %in% c("MGVandBLV") & .$seurat_clusters %in% c(1, 3) ~ "homMG",
+    .$seurat_clusters %in% c(5) ~ "clMonocyte",
+    TRUE ~ "Unclassified"
+  ), col.name = "cell_type")
+
+# Final plots with metadata
+pdf(file.path(FIGURES_DIR, "UMAP_final_metadata.pdf"), width = 12, height = 10)
+DimPlot(merged, group.by = "treatment", pt.size = 0.1)
+DimPlot(merged, group.by = "sort_gate", pt.size = 0.1)
+DimPlot(merged, group.by = "origin", pt.size = 0.1)
+DimPlot(merged, group.by = "cell_type", pt.size = 0.1)
+dev.off()
+
+# ── 9. Final subset & re-clustering ──────────────────────────────────────────
+merged_final <- subset(merged, cell_type != "Unclassified")
+
+# Re-run reductions
+merged_final <- RunTFIDF(merged_final)
+merged_final <- FindTopFeatures(merged_final, min.cutoff = 20)
+merged_final <- RunSVD(merged_final, reduction.key = "LSI_", reduction.name = "lsi")
+merged_final <- RunUMAP(merged_final, dims = 2:30, reduction = "lsi")
+
+merged_final$seurat_clusters_original <- merged_final$seurat_clusters
+
+merged_final <- FindNeighbors(merged_final, reduction = "lsi", dims = 2:30)
+merged_final <- FindClusters(merged_final, resolution = 0.2)
+
+pdf(file.path(FIGURES_DIR, "UMAP_merged_final_by_sample.pdf"), width = 8, height = 6)
+DimPlot(merged_final, group.by = "sample", pt.size = 0.1)
+dev.off()
+
+pdf(file.path(FIGURES_DIR, "UMAP_merged_final_clusters.pdf"), width = 8, height = 6)
+DimPlot(merged_final, group.by = "seurat_clusters", pt.size = 0.1)
+dev.off()
+
+# ── 10. Save final object ─────────────────────────────────────────────────────
+saveRDS(merged_final, file.path(RDS_DIR, "merged_final_scATAC_CAM_Repop.rds"))
+
+cat("Final object saved:", file.path(RDS_DIR, "merged_final_scATAC_CAM_Repop.rds"), "\n")
+cat("Final cells:", ncol(merged_final), "| Final clusters:", length(unique(merged_final$seurat_clusters)), "\n")
+
+sessionInfo()
