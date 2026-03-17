@@ -1,0 +1,520 @@
+# =============================================================================
+# Project:   Bulk RNA-seq – Stroke CAMs (BLZ945 vs Vehicle, ipsi vs contra)
+# Script:    bulkRNAseq_Stroke_CAMs_analysis.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2024
+# Purpose:   Load stroke CAM counts & metadata → QC → sample exclusion → DESeq2
+#            (full interaction model + combined contrasts) → PCA & heatmap →
+#            volcano plots (ipsi vs contra in BLZ945/Vehicle) → DEG heatmap →
+#            category-specific boxplots (macrophage functions) → mean count export.
+#
+# Important notes:
+#   - Samples A3_ipsi and C2_ipsi excluded (low quality/degraded RNA)
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(writexl)
+  library(dplyr)
+  library(tidyr)
+  library(tidyheatmaps)
+  library(tibble)
+  library(ggrepel)
+  library(apeglm)
+  library(ashr)
+  library(gridExtra)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(plotly)
+  library(AnnotationDbi)
+  library(msigdbr)
+  library(readxl)
+  library(openxlsx)
+  library(EnhancedVolcano)
+  library(biomaRt)
+  library(fmsb)          # ggradar
+  library(ggradar)
+  library(scales)
+  library(ggpubr)        # ggarrange
+  library(reshape2)
+  library(patchwork)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/bulkRNAseq_Stroke_CAMs_analysis.R")
+
+COUNTS_FILE   <- here("data/raw/counts.txt")
+COL_DATA_FILE <- here("data/raw/colData.txt")
+
+TABLES_DIR  <- here("results/tables/stroke_cams")
+FIGURES_DIR <- here("results/figures/stroke_cams")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load counts & metadata ────────────────────────────────────────────────
+count_data <- read.table(COUNTS_FILE, header = TRUE, row.names = 1, sep = "\t")
+colData    <- read.table(COL_DATA_FILE, header = TRUE, sep = "\t")
+
+# Reorder columns to match colData
+count_data <- count_data[, match(colData$Sample, colnames(count_data))]
+
+# Factorize metadata
+colData <- colData %>%
+  mutate(
+    Hemisphere = factor(Hemisphere),
+    Treatment  = factor(Treatment)
+  )
+
+# ── 2. Quality Control & sample exclusion ─────────────────────────────────────
+total_counts <- colSums(count_data)
+summary(total_counts)
+
+pdf(file.path(FIGURES_DIR, "library_sizes_stroke_cams.pdf"), width = 10, height = 6)
+barplot(total_counts, main = "Library Sizes Smart-3 Seq Ccr2creERT2×tdT LPS (CAMs)",
+        col = "lightblue", las = 2, cex.names = 0.7)
+dev.off()
+
+# Exclude poor-quality samples (A3_ipsi, C2_ipsi — degraded RNA)
+samples_to_exclude <- c("A3_ipsi", "C2_ipsi")
+
+colData <- colData[!colData$Sample %in% samples_to_exclude, ]
+count_data <- count_data[, !colnames(count_data) %in% samples_to_exclude]
+
+# Re-match order
+count_data <- count_data[, match(colData$Sample, colnames(count_data))]
+
+# Filter low-expressed genes (≥10 counts in ≥ half of samples)
+count_filtered <- count_data[rowSums(count_data > 10) >= ncol(count_data)/2, ]
+cat("Genes after low-count filter:", nrow(count_filtered), "\n")
+
+# ── 3. DESeq2 – Full model with interaction ──────────────────────────────────
+design_formula <- ~ Treatment + Hemisphere + Treatment*Hemisphere
+
+dds <- DESeqDataSetFromMatrix(
+  countData = count_filtered,
+  colData   = colData,
+  design    = design_formula
+)
+
+dds <- estimateSizeFactors(dds)
+dds <- DESeq(dds)
+
+# VST for visualization
+vsd <- vst(dds, blind = TRUE)
+
+# ── 4. PCA Plot ──────────────────────────────────────────────────────────────
+pca_data <- plotPCA(vsd, intgroup = c("Treatment", "Hemisphere"), returnData = TRUE, ntop = 1000)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+p_pca <- ggplot(pca_data, aes(PC1, PC2, color = Treatment, shape = Hemisphere)) +
+  geom_point(size = 4, stroke = 1) +
+  xlab(paste0("PC1: ", percent_var[1], "% variance")) +
+  ylab(paste0("PC2: ", percent_var[2], "% variance")) +
+  labs(title = "PCA of RNA-seq Data (Stroke CAMs)") +
+  guides(color = guide_legend(override.aes = list(shape = c(16)))) +
+  guides(shape = guide_legend(override.aes = list(shape = c(16, 17)))) +
+  theme_minimal()
+
+ggsave(file.path(FIGURES_DIR, "pca_stroke_cams.pdf"), p_pca, width = 8, height = 6)
+
+# ── 5. Combined contrasts (ipsi vs contra in BLZ945 & Vehicle) ────────────────
+colData$combined <- factor(paste0(colData$Treatment, "_", colData$Hemisphere))
+
+design_comb <- ~ combined
+
+dds_comb <- DESeqDataSetFromMatrix(
+  countData = count_filtered,
+  colData   = colData,
+  design    = design_comb
+)
+
+dds_comb <- estimateSizeFactors(dds_comb)
+dds_comb <- DESeq(dds_comb)
+
+# BLZ945 ipsi vs contra
+dds_comb$combined <- relevel(dds_comb$combined, ref = "BLZ945_contralateral")
+dds_comb <- nbinomWaldTest(dds_comb)
+
+res_icB <- results(dds_comb, name = "combined_BLZ945_ipsilateral_vs_BLZ945_contralateral")
+lfcs_icB <- lfcShrink(dds_comb, coef = "combined_BLZ945_ipsilateral_vs_BLZ945_contralateral", type = "apeglm")
+
+lfcs_icB$Gene <- rownames(lfcs_icB)
+lfcs_icB <- na.omit(lfcs_icB)
+
+lfcs_icB$Significance <- ifelse(
+  lfcs_icB$padj < 0.05 & abs(lfcs_icB$log2FoldChange) > 0.59, "p-value and log2 fold change",
+  ifelse(lfcs_icB$padj < 0.05 & abs(lfcs_icB$log2FoldChange) <= 0.59, "p-value",
+         ifelse(abs(lfcs_icB$log2FoldChange) > 0.59, "log2 fold change", "NS"))
+)
+
+colors <- c("p-value and log2 fold change" = "red",
+            "p-value" = "blue",
+            "log2 fold change" = "green",
+            "NS" = "darkgrey")
+
+p_volc_icB <- ggplot(lfcs_icB, aes(x = log2FoldChange, y = -log10(padj), color = Significance)) +
+  geom_point(alpha = 0.5, aes(size = Significance)) +
+  scale_color_manual(values = colors) +
+  scale_size_manual(values = c("p-value and log2 fold change" = 1.5, "p-value" = 1.5, "log2 fold change" = 1.5, "NS" = 1)) +
+  labs(title = "Volcano plot for BLZ ipsilateral vs contralateral",
+       x = "log2 fold change", y = "-log10 adjusted p-value", color = "Significance") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.line = element_line(linewidth = 1),
+        axis.text = element_text(size = 12),
+        plot.title = element_text(size = 14, face = "bold")) +
+  geom_vline(xintercept = c(-0.59, 0.59), linetype = "dashed", color = "darkgrey", linewidth = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkgrey", linewidth = 0.5) +
+  geom_text(data = subset(lfcs_icB, padj < 0.05 & abs(log2FoldChange) > 0.59),
+            aes(label = Gene), vjust = -0.5, hjust = 0.5, size = 1, color = "black", fontface = "italic")
+
+ggsave(file.path(FIGURES_DIR, "volcano_BLZ_ipsi_vs_contra.pdf"), p_volc_icB, width = 8, height = 6)
+
+# Vehicle ipsi vs contra
+dds_comb$combined <- relevel(dds_comb$combined, ref = "Veh_contralateral")
+dds_comb <- nbinomWaldTest(dds_comb)
+
+res_icV <- results(dds_comb, name = "combined_Veh_ipsilateral_vs_Veh_contralateral")
+lfcs_icV <- lfcShrink(dds_comb, coef = "combined_Veh_ipsilateral_vs_Veh_contralateral", type = "apeglm")
+
+lfcs_icV$Gene <- rownames(lfcs_icV)
+lfcs_icV <- na.omit(lfcs_icV)
+
+lfcs_icV$Significance <- ifelse(
+  lfcs_icV$padj < 0.05 & abs(lfcs_icV$log2FoldChange) > 0.59, "p-value and log2 fold change",
+  ifelse(lfcs_icV$padj < 0.05 & abs(lfcs_icV$log2FoldChange) <= 0.59, "p-value",
+         ifelse(abs(lfcs_icV$log2FoldChange) > 0.59, "log2 fold change", "NS"))
+)
+
+p_volc_icV <- ggplot(lfcs_icV, aes(x = log2FoldChange, y = -log10(padj), color = Significance)) +
+  geom_point(alpha = 0.5, aes(size = Significance)) +
+  scale_color_manual(values = colors) +
+  scale_size_manual(values = c("p-value and log2 fold change" = 1.5, "p-value" = 1.5, "log2 fold change" = 1.5, "NS" = 1)) +
+  labs(title = "Volcano plot for ipsilateral vs contralateral - Veh only",
+       x = "log2 fold change", y = "-log10 adjusted p-value", color = "Significance") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.line = element_line(linewidth = 1),
+        axis.text = element_text(size = 12),
+        plot.title = element_text(size = 14, face = "bold")) +
+  geom_vline(xintercept = c(-0.59, 0.59), linetype = "dashed", color = "darkgrey", linewidth = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "darkgrey", linewidth = 0.5) +
+  geom_text(data = subset(lfcs_icV, padj < 0.05 & abs(log2FoldChange) > 0.59),
+            aes(label = Gene), vjust = -0.5, hjust = 0.5, size = 1, color = "black", fontface = "italic")
+
+ggsave(file.path(FIGURES_DIR, "volcano_Veh_ipsi_vs_contra.pdf"), p_volc_icV, width = 8, height = 6)
+
+# ── 7. Ipsilateral-only analysis (BLZ945 vs Veh) ──────────────────────────────
+colData_ipsi <- colData[colData$Hemisphere == "ipsilateral", ]
+count_filt_ipsi <- count_filtered[, colnames(count_filtered) %in% colData_ipsi$Sample]
+
+design_formula_ipsi <- ~ Treatment
+
+dds_ipsi <- DESeqDataSetFromMatrix(
+  countData = count_filt_ipsi,
+  colData   = colData_ipsi,
+  design    = design_formula_ipsi
+)
+
+dds_ipsi$Treatment <- relevel(dds_ipsi$Treatment, ref = "Veh")
+dds_ipsi <- estimateSizeFactors(dds_ipsi)
+dds_ipsi <- DESeq(dds_ipsi)
+
+lfcs_iBV <- lfcShrink(dds_ipsi, coef = "Treatment_BLZ945_vs_Veh", type = "apeglm")
+
+# ── 8. Contralateral-only analysis (BLZ945 vs Veh) ────────────────────────────
+colData_CTL <- colData[colData$Hemisphere == "contralateral", ]
+count_CTL   <- count_filtered[, colnames(count_filtered) %in% colData_CTL$Sample]
+
+design_formula_CTL <- ~ Treatment
+
+dds_CTL <- DESeqDataSetFromMatrix(
+  countData = count_CTL,
+  colData   = colData_CTL,
+  design    = design_formula_CTL
+)
+
+dds_CTL <- estimateSizeFactors(dds_CTL)
+dds_CTL <- DESeq(dds_CTL)
+
+dds_CTL$Treatment <- relevel(dds_CTL$Treatment, ref = "Veh")
+dds_CTL <- nbinomWaldTest(dds_CTL)
+
+lfc_shrink_CTL <- lfcShrink(dds_CTL, coef = "Treatment_BLZ945_vs_Veh", type = "apeglm")
+
+# ── 9. DEG Heatmap (union of top DEGs from all contrasts) ─────────────────────
+DEG_V   <- lfcs_icV[!is.na(lfcs_icV$padj) & !is.na(lfcs_icV$log2FoldChange), ]
+DEG_B   <- lfcs_icB[!is.na(lfcs_icB$padj) & !is.na(lfcs_icB$log2FoldChange), ]
+DEG_BV  <- lfcs_iBV[!is.na(lfcs_iBV$padj) & !is.na(lfcs_iBV$log2FoldChange), ]
+DEG_CTL <- lfc_shrink_CTL[!is.na(lfc_shrink_CTL$padj) & !is.na(lfc_shrink_CTL$log2FoldChange), ]
+
+DEG_V   <- DEG_V[DEG_V$padj < 0.05 & abs(DEG_V$log2FoldChange) > 0.59, ]
+DEG_B   <- DEG_B[DEG_B$padj < 0.05 & abs(DEG_B$log2FoldChange) > 0.59, ]
+DEG_BV  <- DEG_BV[DEG_BV$padj < 0.05 & abs(DEG_BV$log2FoldChange) > 0.59, ]
+DEG_CTL <- DEG_CTL[DEG_CTL$padj < 0.05 & abs(DEG_CTL$log2FoldChange) > 0.59, ]
+
+DEG_V_top   <- DEG_V[order(DEG_V$padj), ][1:1239, ]
+DEG_B_top   <- DEG_B[order(DEG_B$padj), ][1:1972, ]
+DEG_BV_top  <- DEG_BV[order(DEG_BV$padj), ][1:13, ]
+DEG_CTL_top <- DEG_CTL[order(DEG_CTL$padj), ][1:42, ]
+
+genes_2 <- rownames(DEG_V_top)
+genes_3 <- rownames(DEG_B_top)
+genes_4 <- rownames(DEG_BV_top)
+genes_5 <- rownames(DEG_CTL_top)
+
+genes <- union(genes_2, genes_3)
+genes <- union(genes, genes_4)
+genes <- union(genes, genes_5)
+
+dds_mat <- counts(dds, normalized = TRUE)
+mat <- dds_mat[rownames(dds_mat) %in% genes, ]
+
+mat_df <- as.data.frame(mat)
+transposed_mat <- t(mat_df)
+scaled_mat <- scale(transposed_mat, center = TRUE, scale = TRUE)
+scaled_mat <- t(scaled_mat)
+
+annotation_col <- as.data.frame(colData[, c("Treatment", "Hemisphere"), drop = FALSE])
+rownames(annotation_col) <- colData$Sample
+
+pheatmap(
+  scaled_mat,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  fontsize = 5,
+  fontsize_row = 2,
+  fontsize_col = 8,
+  cellwidth = 20,
+  annotation_col = annotation_col,
+  filename = file.path(FIGURES_DIR, "heatmap_DEG_stroke_cams.pdf")
+)
+
+# ── 10. Venn diagram – upregulated genes (BLZ945 vs Vehicle ipsi vs contra) ─────
+significant_genes_B <- rownames(GO_B)
+significant_genes_V <- rownames(GO_V)
+
+venn.plot <- venn.diagram(
+  x = list(
+    `BLZ945` = significant_genes_B,
+    `Vehicle` = significant_genes_V
+  ),
+  filename = NULL,
+  fill = c("#E69F00", "#56B4E9"),
+  alpha = 0.5,
+  cex = 2,
+  cat.cex = 1.5,
+  cat.pos = c(0, 0),
+  main = "Venn Diagram significant DEGs: BLZ945 (ipsi vs contra) vs Vehicle (ipsi vs contra)",
+  main.cex = 1.5
+)
+
+pdf(file.path(FIGURES_DIR, "venn_upregulated_BLZ_vs_Veh.pdf"))
+grid.draw(venn.plot)
+dev.off()
+
+# ── 11. GO enrichment – differential stroke response (unique to BLZ945 vs Vehicle) ─
+B <- setdiff(significant_genes_B, significant_genes_V)
+V <- setdiff(significant_genes_V, significant_genes_B)
+
+background_genes <- rownames(count_filtered)
+org_db <- org.Mm.eg.db
+
+enrichGO_result_B <- enrichGO(
+  gene = B,
+  OrgDb = org.Mm.eg.db,
+  universe = background_genes,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.2,
+  qvalueCutoff = 0.05,
+  minGSSize = 3,
+  maxGSSize = 500,
+  keyType = "SYMBOL"
+)
+
+enrichGO_result_V <- enrichGO(
+  gene = V,
+  OrgDb = org.Mm.eg.db,
+  universe = background_genes,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.2,
+  qvalueCutoff = 0.05,
+  minGSSize = 3,
+  maxGSSize = 500,
+  keyType = "SYMBOL"
+)
+
+ego_B <- simplify(enrichGO_result_B, cutoff = 0.6, by = "p.adjust", measure = "Wang")
+ego_V <- simplify(enrichGO_result_V, cutoff = 0.6, by = "p.adjust", measure = "Wang")
+
+pdf(file.path(FIGURES_DIR, "GO_differential_stroke_response.pdf"), width = 10, height = 6)
+
+barplot(ego_V, showCategory = 10, title = "Up in Veh ipsi v contra") +
+  scale_fill_gradient(low = "#F8766D", high = "white") +
+  theme_minimal() +
+  geom_bar(stat = "identity", color = "black")
+
+barplot(enrichGO_result_B, showCategory = 10, title = "Up in BLZ ipsi v contra") +
+  scale_fill_gradient(low = "#7CAE00", high = "white") +
+  theme_minimal() +
+  geom_bar(stat = "identity", color = "black")
+
+dev.off()
+
+# ── 12. Category-specific boxplots (macrophage functional groups) ──────────────
+# These genes come from the significant_genes_B, significant_genes_V lists --> upregulated in stroke
+
+macrophage_functions <- list(
+  Phagocytosis_Clearance = c("Adgre1", "Aif1", "Apoe", "C1qa", "C1qb", "C1qc", "Cd36", "Cd68",
+                             "Clec12a", "Csf1r", "Ctsa", "Ctsb", "Ctsc", "Ctss", "Ctsz", "Cx3cr1",
+                             "Dnase2a", "Fcgr2b", "Fcgr3", "Grn", "Itgam", "Laptm5", "Lgals3bp",
+                             "Lgmn", "Lipa", "Lyve1", "Ms4a6d", "Ms4a7", "Mrc1", "P2rx4", "P2rx7",
+                             "Tmem106a", "Tmem119"),
+  
+  Cytokine_Chemokine_Production = c("Alox5", "C3ar1", "C5ar1", "Ccl8", "Ccr2", "Ccr5", "Cd38", "Cd86",
+                                    "Cxcl10", "Cxcl16", "Gpr65", "Ifngr1", "Il4ra", "Irak4", "Itgax",
+                                    "Itgb2", "Ly9", "Myd88", "Nfkb2", "P2ry6", "Pik3ap1", "Plcg2",
+                                    "Ptgs1", "Spi1", "Tlr1", "Tlr2", "Tlr4", "Tlr7", "Tlr12", "Tlr13",
+                                    "Tnfrsf1a"),
+  
+  Oxidative_Stress_ROS = c("Cyba", "Cybb", "Cybc1", "Hk3", "Hvcn1", "Nrros", "Padi2"),
+  
+  Immune_Modulation_Signaling = c("Adcy7", "Adora3", "Arrb2", "Cd22", "Cd163", "Cd48", "Cmtm3", "Cmtm6",
+                                  "Csf2ra", "Cx3cr1", "Dok1", "Fcna", "Fcrl2", "Gpr183", "Ikbkb",
+                                  "Il13ra1", "Inpp5d", "Itga6", "Itga9", "Itgav", "Itgb5", "Lyn", "Nfam1",
+                                  "Nfatc1", "P2ry13", "Pak1", "Plcl2", "Prkcb", "Rassf5", "Sh2b3",
+                                  "Siglece", "Sipa1", "Sirpa", "Sting1", "Ticam2", "Tnfrsf1b", "Vav1"),
+  
+  Metabolism_Lipid_Processing = c("Abcc3", "Abhd12", "Abhd17c", "Acer3", "Acly", "Acsl4", "Acsl5",
+                                  "Acss1", "Asah1", "Cept1", "Cerk", "Daglb", "Ldah", "Lipa", "Lpcat1",
+                                  "Lpin2", "Pla2g15", "Pld3", "Pnpla7", "Smpdl3b"),
+  
+  Proliferation_Cell_Cycle = c("Ccnd1", "Cdt1", "E2f1", "E2f3", "Mcm2", "Mcm3", "Mcm5", "Mcm6",
+                               "Nfatc1", "Nfe2l2"),
+  
+  Motility_Adhesion = c("Abi2", "Arap1", "Arhgap25", "Arhgap45", "Coro7", "Dab2", "Dock2", "Dock8",
+                        "Eps8", "Fnbp1", "Itga6", "Itga9", "Itgav", "Itgb2", "Itgb5", "Myo1f",
+                        "Plek", "Sdc3"),
+  
+  Lysosomal_Function = c("Atp6v0a1", "Ctsa", "Ctsb", "Ctsc", "Ctss", "Ctsz", "Dnase2a", "Grn",
+                         "Laptm5", "Lgmn", "Lipa", "Naglu", "Tpp1"),
+  
+  Repair_Anti_Inflammatory = c("Apoe", "Grn", "Il4ra", "Mrc1", "Socs3", "Tgfb1", "Tgfbr1", "Tgfbr2")
+)
+
+# Function to generate boxplots for a gene list (as in original)
+generate_plots <- function(genes, category_name) {
+  genes <- intersect(genes, rownames(dds_comb))
+  if (length(genes) == 0) {
+    message(paste("No genes from", category_name, "found in dds_comb"))
+    return(NULL)
+  }
+  
+  plots <- lapply(genes, function(g) {
+    tryCatch({
+      df <- plotCounts(dds_comb, gene = g, intgroup = "combined", returnData = TRUE)
+      df$log_count <- log2(df$count + 1)
+      
+      anova_result <- aov(log_count ~ combined, data = df)
+      anova_p <- summary(anova_result)[[1]][["Pr(>F)"]][1]
+      
+      if (anova_p < 0.05) {
+        tukey_result <- TukeyHSD(anova_result)
+        p_vals <- tukey_result$combined[, "p adj"]
+        sig_p_vals <- p_vals[p_vals < 0.05]
+        labels <- if (length(sig_p_vals) > 0) {
+          paste(names(sig_p_vals), sprintf("p=%.5f", sig_p_vals), sep = ": ")
+        } else {
+          "No sig. pairwise diffs"
+        }
+      } else {
+        labels <- "ANOVA NS"
+      }
+      
+      p <- ggplot(df, aes(x = combined, y = count, fill = combined)) +
+        geom_boxplot(outlier.shape = NA) +
+        geom_jitter(width = 0.2, alpha = 0.6) +
+        labs(title = g, x = "", y = "Normalized Counts") +
+        theme_minimal() +
+        theme(axis.text.x = element_blank(),
+              axis.title.x = element_blank(),
+              legend.position = "none") +
+        annotate("text", x = Inf, y = Inf, label = paste(labels, collapse = "\n"),
+                 hjust = 1, vjust = 1, size = 2.5, color = "black")
+      
+      return(p)
+    }, error = function(e) {
+      message(paste("Error with gene", g, "in", category_name, ":", e$message))
+      return(NULL)
+    })
+  })
+  
+  plots <- plots[!sapply(plots, is.null)]
+  
+  if (length(plots) > 0) {
+    combined_plot <- ggarrange(plotlist = plots,
+                               ncol = 4,
+                               nrow = ceiling(length(plots) / 4),
+                               common.legend = TRUE,
+                               legend = "right") +
+      ggtitle(category_name) +
+      theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+    return(combined_plot)
+  } else {
+    return(NULL)
+  }
+}
+
+# Generate plots per category
+plot_pages <- lapply(names(macrophage_functions), function(category) {
+  genes <- macrophage_functions[[category]]
+  generate_plots(genes, category)
+})
+names(plot_pages) <- names(macrophage_functions)
+
+# Remove NULL plots
+plot_pages <- plot_pages[!sapply(plot_pages, is.null)]
+
+# Save each category plot as separate PDF (15 inch width, dynamic height)
+for (category in names(plot_pages)) {
+  n_plots <- length(plot_pages[[category]]$plots)
+  height <- max(10, ceiling(n_plots / 4) * 4)  # approximate scaling
+  pdf(file.path(FIGURES_DIR, paste0("boxplots_macrophage_", category, ".pdf")), width = 15, height = height)
+  print(plot_pages[[category]])
+  dev.off()
+}
+
+# ── 13. Export mean counts table (ipsilateral & contralateral) ────────────────
+all_genes <- unique(unlist(macrophage_functions))
+
+norm_counts <- counts(dds_comb, normalized = TRUE)[all_genes[all_genes %in% rownames(counts(dds_comb))], , drop = FALSE]
+
+ipsi_samples <- colData(dds_comb)$combined %in% c("BLZ945_contralateral", "Veh_contralateral", "BLZ945_ipsilateral", "Veh_ipsilateral")
+norm_counts_ipsi <- norm_counts[, ipsi_samples]
+
+mean_counts <- data.frame(
+  Gene = rownames(norm_counts_ipsi),
+  Veh_contralateral_mean = rowMeans(norm_counts_ipsi[, colData(dds_comb)$combined[ipsi_samples] == "Veh_contralateral", drop = FALSE]),
+  BLZ_contralateral_mean = rowMeans(norm_counts_ipsi[, colData(dds_comb)$combined[ipsi_samples] == "BLZ945_contralateral", drop = FALSE]),
+  Veh_ipsilateral_mean   = rowMeans(norm_counts_ipsi[, colData(dds_comb)$combined[ipsi_samples] == "Veh_ipsilateral", drop = FALSE]),
+  BLZ_ipsilateral_mean   = rowMeans(norm_counts_ipsi[, colData(dds_comb)$combined[ipsi_samples] == "BLZ945_ipsilateral", drop = FALSE])
+)
+
+category_mapping <- stack(macrophage_functions)
+colnames(category_mapping) <- c("Gene", "Category")
+
+mean_counts <- mean_counts %>%
+  left_join(category_mapping, by = "Gene") %>%
+  arrange(Category, Gene)
+
+write.table(mean_counts, file.path(TABLES_DIR, "mean_counts_stroke_cams.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+
+cat("Mean counts table exported to:", file.path(TABLES_DIR, "mean_counts_stroke_cams.txt"), "\n")
+
+sessionInfo()
