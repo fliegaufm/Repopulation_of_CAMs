@@ -408,15 +408,11 @@ org_db <- org.Mm.eg.db
 neg_B_Stroke_up <- neg_B_Stroke[!is.na(neg_B_Stroke$padj) & neg_B_Stroke$padj < 0.05 & neg_B_Stroke$log2FoldChange > 0, ]
 pos_B_Stroke_up <- pos_B_Stroke[!is.na(pos_B_Stroke$padj) & pos_B_Stroke$padj < 0.05 & pos_B_Stroke$log2FoldChange > 0, ]
 neg_V_Stroke_up <- neg_V_Stroke[!is.na(neg_V_Stroke$padj) & neg_V_Stroke$padj < 0.05 & neg_V_Stroke$log2FoldChange > 0, ]
-MG_BLZ_Stroke_up <- MG_BLZ_Stroke[!is.na(MG_BLZ_Stroke$padj) & MG_BLZ_Stroke$padj < 0.05 & MG_BLZ_Stroke$log2FoldChange > 0, ]
-MG_V_Stroke_up <- MG_V_Stroke[!is.na(MG_V_Stroke$padj) & MG_V_Stroke$padj < 0.05 & MG_V_Stroke$log2FoldChange > 0, ]
 
 # Extract the gene names from the subsets
 sign_neg_B <- rownames(neg_B_Stroke_up)
 sign_pos_B <- rownames(pos_B_Stroke_up)
 sign_neg_V <- rownames(neg_V_Stroke_up)
-sign_mg_B <- rownames(MG_BLZ_Stroke_up)
-sign_mg_V <- rownames(MG_V_Stroke_up)
 
 # Perform GO term analysis for neg_B_Stroke_up genes
 enrichGO_result_neg_B <- enrichGO(
@@ -490,7 +486,7 @@ barplot(ego_neg_V, showCategory = 10, title = "GO Stroke neg_V") +
   geom_bar(stat = "identity", color = "black")
 
 
-# ── 12. Venn diagram – upregulated stroke-induced genes ───────────────────────
+# ── 13. Venn diagram – upregulated stroke-induced genes ───────────────────────
 deg_neg_b_stroke <- neg_B_Stroke[!is.na(neg_B_Stroke$padj) & neg_B_Stroke$padj < 0.05 & neg_B_Stroke$log2FoldChange > 0.59, ]
 deg_pos_b_stroke <- pos_B_Stroke[!is.na(pos_B_Stroke$padj) & pos_B_Stroke$padj < 0.05 & pos_B_Stroke$log2FoldChange > 0.59, ]
 deg_neg_v_stroke <- neg_V_Stroke[!is.na(neg_V_Stroke$padj) & neg_V_Stroke$padj < 0.05 & neg_V_Stroke$log2FoldChange > 0.59, ]
@@ -532,7 +528,7 @@ non_intersecting_genes <- list(
 
 print(non_intersecting_genes)
 
-# ── 13. Bar plot – overlapping CAM stroke-induced genes higher in each condition ──
+# ── 14. Bar plot – overlapping CAM stroke-induced genes higher in each condition ──
 common_stroke_genes <- Reduce(union, list(genes_deg_neg_b_stroke, genes_deg_pos_b_stroke, genes_deg_neg_v_stroke))
 cat("Number of overlapping genes:", length(common_stroke_genes), "\n")
 
@@ -566,7 +562,7 @@ p_bar <- ggplot(counts_summary, aes(x = Higher_In, y = Count, fill = Higher_In))
 
 ggsave(file.path(FIGURES_DIR, "bar_overlapping_stroke_genes.pdf"), p_bar, width = 10, height = 6)
 
-# ── 14. Average highest mean expression distance to second ─────────────────────
+# ── 15. Average highest mean expression distance to second ─────────────────────
 condition_cols <- setdiff(colnames(mean_counts), c("Gene", "Higher_In"))
 
 mean_counts_avg <- mean_counts %>%
@@ -610,7 +606,7 @@ p_percent_bar <- ggplot(group_stats_filtered, aes(x = Higher_In, y = mean_percen
 
 ggsave(file.path(FIGURES_DIR, "bar_percent_higher_stroke.pdf"), p_percent_bar, width = 10, height = 6)
 
-# ── 15. Overlap check & volcano overlays ──────────────────────────────────────
+# ── 16. Overlap check & volcano overlays ──────────────────────────────────────
 # CAM pos vs neg overlay (example shown; repeat pattern for MG)
 deg_neg_b_stroke_both <- neg_B_Stroke[!is.na(neg_B_Stroke$padj) & neg_B_Stroke$padj < 0.05 & abs(neg_B_Stroke$log2FoldChange) > 0.59, ]
 
@@ -681,7 +677,7 @@ p_mg_overlay <- ggplot(volcano_df_mg, aes(x = log2FoldChange, y = neg_log10_padj
 
 ggsave(file.path(FIGURES_DIR, "volcano_MG_pos_overlay.pdf"), p_mg_overlay, width = 8, height = 6)
 
-# ── 16. Stroke milieu genes boxplots on CAMs ──────────────────────────────────
+# ── 17. Stroke milieu genes boxplots on CAMs ──────────────────────────────────
 colData_stroke <- combined_colData[combined_colData$combined1 %in% c("neg_V_Stroke", "neg_B_Stroke", "pos_B_Stroke"), ]
 count_filt_stroke <- count_filtered[, colnames(count_filtered) %in% colData_stroke$Sample]
 
