@@ -1,0 +1,572 @@
+# =============================================================================
+# Project:   Bulk RNA-seq – LPS treatment in Ccr2-creERT2 × tdT model
+# Script:    bulkRNAseq_LPS_Ccr2_analysis.R
+# Author:    Maximilian Fliegauf
+# Date:      11/2024
+# Purpose:   Load counts & metadata → QC → gene filtering (ribosomal/mito/pseudo/patterns)
+#            → DESeq2 (full dataset + CAM-only + CTL-only) → volcano plots → GO enrichment
+#            → radar/spider plots → Venn diagrams → bar plots of LPS-induced genes.
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggrepel)
+  library(apeglm)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(plotly)
+  library(AnnotationDbi)
+  library(msigdbr)
+  library(EnhancedVolcano)
+  library(biomaRt)
+  library(fmsb)          # ggradar
+  library(scales)
+  library(VennDiagram)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/bulkRNAseq_LPS_Ccr2_analysis.R")
+
+COUNTS_FILE   <- here("data/raw/counts_LPS_Ccr2.txt")
+COL_DATA_FILE <- here("data/raw/colData_LPS_Ccr2.txt")
+
+TABLES_DIR  <- here("results/tables/bulkRNAseq")
+FIGURES_DIR <- here("results/figures/bulkRNAseq")
+
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load raw counts & metadata ────────────────────────────────────────────
+count_data <- read.table(COUNTS_FILE, header = TRUE, row.names = 1, sep = "\t")
+colData    <- read.table(COL_DATA_FILE, header = TRUE, sep = "\t")
+
+# Match & reorder columns
+colnames(count_data) <- colData$Sample
+count_data <- count_data[, match(colData$Sample, colnames(count_data))]
+
+# Create combined factors
+colData <- colData %>%
+  mutate(
+    combined  = factor(paste0(Treatment, "_", Condition)),
+    combined1 = factor(paste0(cell_type, "_", combined))
+  )
+
+# ── 2. Quality Control ───────────────────────────────────────────────────────
+total_counts <- colSums(count_data)
+summary(total_counts)
+
+pdf(file.path(FIGURES_DIR, "library_sizes.pdf"), width = 10, height = 6)
+barplot(total_counts, main = "Library Sizes – Smart-3 Seq Ccr2creERT2×tdT LPS",
+        col = "lightblue", las = 2, cex.names = 0.7)
+dev.off()
+
+# Filter low-expressed genes (≥10 counts in ≥ half of samples)
+count_filtered <- count_data[rowSums(count_data > 10) >= ncol(count_data)/2, ]
+cat("Genes after low-count filter:", nrow(count_filtered), "\n")
+
+# ── 3. Gene filtering (ribosomal, mitochondrial, pseudogenes, patterns) ───────
+# KEGG pathways
+ribo_genes <- msigdbr(species = "Mus musculus", category = "C2") %>%
+  filter(gs_name == "KEGG_RIBOSOME") %>% pull(gene_symbol)
+
+mito_genes <- msigdbr(species = "Mus musculus", category = "C2") %>%
+  filter(gs_name == "KEGG_OXIDATIVE_PHOSPHORYLATION") %>% pull(gene_symbol)
+
+# biomaRt
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl", host = "https://www.ensembl.org")
+
+pseudo_genes <- getBM(attributes = c("external_gene_name"),
+                      filters = "biotype",
+                      values = c("pseudogene", "predicted", "novel", "uncharacterized"),
+                      mart = mart) %>% pull(external_gene_name)
+
+noncoding_genes <- getBM(attributes = c("external_gene_name"),
+                         filters = "biotype",
+                         values = c("lincRNA", "miRNA", "snRNA", "snoRNA"),
+                         mart = mart) %>% pull(external_gene_name)
+
+# Pattern-based exclusion
+patterns <- c("Mrp", "Rpl", "Rps", "Sn", "Sf", "Gtf", "Med", "Rbm", "Rik",
+              "Lsm", "Eif", "Atp", "Nduf", "Tomm", "Pol", "Anap", "Rna", "Gm", "Ddx",
+              "Smim", "Zfp", "Bola", "Dna", "Timm", "Micos")
+
+pattern_genes <- grep(paste(patterns, collapse = "|"), rownames(count_filtered), value = TRUE)
+
+# Combine all exclusion lists
+ex_genes <- unique(c(ribo_genes, mito_genes, pseudo_genes, noncoding_genes, pattern_genes))
+
+# Apply filter
+count_filtered <- count_filtered[!rownames(count_filtered) %in% ex_genes, ]
+
+cat("Genes excluded:", length(ex_genes), "\n")
+cat("Remaining genes:", nrow(count_filtered), "\n")
+
+writeLines(ex_genes, file.path(TABLES_DIR, "excluded_genes.txt"))
+
+# ── 4. DESeq2 – Full dataset ─────────────────────────────────────────────────
+design_full <- ~ combined + cell_type
+
+dds <- DESeqDataSetFromMatrix(
+  countData = count_filtered,
+  colData   = colData,
+  design    = design_full
+)
+
+dds <- estimateSizeFactors(dds)
+dds <- DESeq(dds)
+
+# VST for visualization
+vsd <- vst(dds, blind = TRUE)
+vsd_mat <- assay(vsd)
+
+# ── 5. PCA & unbiased heatmap (full dataset) ─────────────────────────────────
+pca_data <- plotPCA(vsd, intgroup = c("cell_type", "combined"), returnData = TRUE, ntop = 100)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+p_pca <- ggplot(pca_data, aes(PC1, PC2, color = cell_type, shape = combined)) +
+  geom_point(size = 4, stroke = 1) +
+  xlab(paste0("PC1: ", percent_var[1], "% variance")) +
+  ylab(paste0("PC2: ", percent_var[2], "% variance")) +
+  labs(title = "PCA of RNA-seq Data with Multiple Variables") +
+  guides(color = guide_legend(override.aes = list(shape = c(16)))) +
+  guides(shape = guide_legend(override.aes = list(shape = c(16, 17)))) +
+  theme_minimal()
+
+ggsave(file.path(FIGURES_DIR, "pca_full_dataset.pdf"), p_pca, width = 8, height = 6)
+
+# Heatmap of top 100 most variable genes
+gene_variances <- apply(vsd_mat, 1, var)
+top_variable_genes <- order(gene_variances, decreasing = TRUE)[1:100]
+vsd_mat_top <- vsd_mat[top_variable_genes, ]
+
+annotation_col <- as.data.frame(colData[, c("cell_type", "combined"), drop = FALSE])
+rownames(annotation_col) <- colData$Sample
+
+pheatmap(
+  vsd_mat_top,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  fontsize = 5,
+  fontsize_row = 5,
+  fontsize_col = 8,
+  annotation_col = annotation_col,
+  filename = file.path(FIGURES_DIR, "heatmap_top100_variable_genes.pdf")
+)
+
+# ── 6. LPS activation contrasts (MG, tdT-, tdT+) ─────────────────────────────
+design_lps <- ~ combined1
+dds_lps <- DESeqDataSetFromMatrix(countData = count_filtered, colData = colData, design = design_lps)
+dds_lps <- estimateSizeFactors(dds_lps)
+dds_lps <- DESeq(dds_lps)
+
+# MG LPS vs CTL
+lfc_shrink_MG <- lfcShrink(dds_lps, coef = "combined1_MG_BLZ_LPS_vs_MG_BLZ_CTL", type = "apeglm")
+
+p_volc_mg <- EnhancedVolcano(
+  lfc_shrink_MG,
+  lab = rownames(lfc_shrink_MG),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "MG: LPS vs CTL"
+)
+ggsave(file.path(FIGURES_DIR, "volcano_MG_LPS_vs_CTL.pdf"), p_volc_mg, width = 8, height = 6)
+
+# tdT- (neg) LPS vs CTL
+dds_lps$combined1 <- relevel(dds_lps$combined1, ref = "neg_BLZ_CTL")
+dds_lps <- nbinomWaldTest(dds_lps)
+lfc_shrink_neg <- lfcShrink(dds_lps, coef = "combined1_neg_BLZ_LPS_vs_neg_BLZ_CTL", type = "apeglm")
+
+p_volc_neg <- EnhancedVolcano(
+  lfc_shrink_neg,
+  lab = rownames(lfc_shrink_neg),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "tdT-: LPS vs CTL"
+)
+ggsave(file.path(FIGURES_DIR, "volcano_neg_LPS_vs_CTL.pdf"), p_volc_neg, width = 8, height = 6)
+
+# tdT+ (pos) LPS vs CTL
+dds_lps$combined1 <- relevel(dds_lps$combined1, ref = "pos_BLZ_CTL")
+dds_lps <- nbinomWaldTest(dds_lps)
+lfc_shrink_pos <- lfcShrink(dds_lps, coef = "combined1_pos_BLZ_LPS_vs_pos_BLZ_CTL", type = "apeglm")
+
+p_volc_pos <- EnhancedVolcano(
+  lfc_shrink_pos,
+  lab = rownames(lfc_shrink_pos),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "tdT+: LPS vs CTL"
+)
+ggsave(file.path(FIGURES_DIR, "volcano_pos_LPS_vs_CTL.pdf"), p_volc_pos, width = 8, height = 6)
+
+# ── 7. GO enrichment – LPS upregulated genes ─────────────────────────────────
+res_mg  <- results(dds_lps, name = "combined1_MG_BLZ_LPS_vs_MG_BLZ_CTL")
+res_neg <- results(dds_lps, name = "combined1_neg_BLZ_LPS_vs_neg_BLZ_CTL")
+res_pos <- results(dds_lps, name = "combined1_pos_BLZ_LPS_vs_pos_BLZ_CTL")
+
+background_genes <- rownames(count_filtered)
+
+go_mg_up  <- enrichGO(
+  gene = rownames(res_mg)[res_mg$padj < 0.05 & res_mg$log2FoldChange > 0],
+  OrgDb = org.Mm.eg.db, universe = background_genes, ont = "BP",
+  pAdjustMethod = "BH", pvalueCutoff = 0.2, qvalueCutoff = 0.05,
+  minGSSize = 3, keyType = "SYMBOL"
+)
+
+go_neg_up <- enrichGO(
+  gene = rownames(res_neg)[res_neg$padj < 0.05 & res_neg$log2FoldChange > 0],
+  OrgDb = org.Mm.eg.db, universe = background_genes, ont = "BP",
+  pAdjustMethod = "BH", pvalueCutoff = 0.2, qvalueCutoff = 0.05,
+  minGSSize = 3, keyType = "SYMBOL"
+)
+
+go_pos_up <- enrichGO(
+  gene = rownames(res_pos)[res_pos$padj < 0.05 & res_pos$log2FoldChange > 0],
+  OrgDb = org.Mm.eg.db, universe = background_genes, ont = "BP",
+  pAdjustMethod = "BH", pvalueCutoff = 0.2, qvalueCutoff = 0.05,
+  minGSSize = 3, keyType = "SYMBOL"
+)
+
+ego_mg  <- simplify(go_mg_up,  cutoff = 0.6, by = "p.adjust", measure = "Wang")
+ego_neg <- simplify(go_neg_up, cutoff = 0.6, by = "p.adjust", measure = "Wang")
+ego_pos <- simplify(go_pos_up, cutoff = 0.6, by = "p.adjust", measure = "Wang")
+
+pdf(file.path(FIGURES_DIR, "GO_LPS_upregulated.pdf"), width = 10, height = 6)
+
+barplot(ego_mg,  showCategory = 10, title = "GO BP: MG LPS vs CTL (Up)") +
+  scale_fill_gradient(low = "#00A9FF", high = "white") +
+  theme_minimal() +
+  geom_bar(stat = "identity", color = "black")
+
+barplot(ego_neg, showCategory = 10, title = "GO BP: tdT- LPS vs CTL (Up)") +
+  scale_fill_gradient(low = "#F8766D", high = "white") +
+  theme_minimal() +
+  geom_bar(stat = "identity", color = "black")
+
+barplot(ego_pos, showCategory = 10, title = "GO BP: tdT+ LPS vs CTL (Up)") +
+  scale_fill_gradient(low = "#7CAE00", high = "white") +
+  theme_minimal() +
+  geom_bar(stat = "identity", color = "black")
+
+dev.off()
+
+# ── 8. CAM-only analysis (pos vs neg in LPS) ──────────────────────────────────
+colData_CAM <- colData %>% filter(cell_type %in% c("neg", "pos"))
+count_CAM   <- count_filtered[, colData_CAM$Sample]
+
+dds_CAM <- DESeqDataSetFromMatrix(
+  countData = count_CAM,
+  colData   = colData_CAM,
+  design    = ~ combined1
+)
+
+dds_CAM <- DESeq(dds_CAM)
+
+# PCA – CAM only
+vsd_CAM <- vst(dds_CAM, blind = TRUE)
+pca_CAM <- plotPCA(vsd_CAM, intgroup = c("cell_type", "combined"), returnData = TRUE, ntop = 100)
+percent_var_CAM <- round(100 * attr(pca_CAM, "percentVar"))
+
+p_pca_cam <- ggplot(pca_CAM, aes(PC1, PC2, color = cell_type, shape = combined)) +
+  geom_point(size = 4, stroke = 1) +
+  xlab(paste0("PC1: ", percent_var_CAM[1], "% variance")) +
+  ylab(paste0("PC2: ", percent_var_CAM[2], "% variance")) +
+  labs(title = "PCA – CAMs only") +
+  theme_minimal()
+
+ggsave(file.path(FIGURES_DIR, "pca_CAM_only.pdf"), p_pca_cam, width = 8, height = 6)
+
+# Volcano – CAM pos vs neg LPS
+dds_CAM$combined1 <- relevel(dds_CAM$combined1, ref = "neg_BLZ_LPS")
+dds_CAM <- nbinomWaldTest(dds_CAM)
+lfc_CAM_LPS <- lfcShrink(dds_CAM, coef = "combined1_pos_BLZ_LPS_vs_neg_BLZ_LPS", type = "apeglm")
+
+p_volc_CAM_LPS <- EnhancedVolcano(
+  lfc_CAM_LPS,
+  lab = rownames(lfc_CAM_LPS),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "CAMs LPS: pos vs neg",
+  labSize = 1, max.overlaps = 100
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_LPS_pos_vs_neg.pdf"), p_volc_CAM_LPS, width = 8, height = 6)
+
+# ── 9. CTL-only analysis (pos vs neg) ─────────────────────────────────────────
+colData_CTL <- colData %>% filter(Condition == "CTL" & cell_type %in% c("neg", "pos"))
+count_CTL   <- count_filtered[, colData_CTL$Sample]
+
+dds_CAM_CTL <- DESeqDataSetFromMatrix(
+  countData = count_CTL,
+  colData   = colData_CTL,
+  design    = ~ cell_type
+)
+
+dds_CAM_CTL <- DESeq(dds_CAM_CTL)
+
+lfc_CTL <- lfcShrink(dds_CAM_CTL, coef = "cell_type_pos_vs_neg", type = "apeglm")
+
+p_volc_CTL <- EnhancedVolcano(
+  lfc_CTL,
+  lab = rownames(lfc_CTL),
+  x = "log2FoldChange", y = "padj",
+  pCutoff = 0.05, FCcutoff = 1,
+  title = "CAMs CTL: pos vs neg",
+  labSize = 3, max.overlaps = 100
+)
+
+ggsave(file.path(FIGURES_DIR, "volcano_CAM_CTL_pos_vs_neg.pdf"), p_volc_CTL, width = 8, height = 6)
+
+# ── 10. Radar / Spider plots (homeostatic + LPS signature genes) ──────────────
+hom_genes <- c(
+  "Spp1", "Tnfaip3", "Nfkbiz", "Hdac4", "Gadd45b", "Il6",
+  "Ccl3", "Ccl9", "Fkbp5", "Fpr1", "Id2",
+  "Il15ra", "Il1rn", "Itga5", "C3", "Itgal",
+  "Mmp19", "Msrb1", "Ms4a6d", "Nfkbia", "Csf3", "Ikbke", "Mmp14",
+  "Lcn2", "Ccl5", "Ccl17", "Cxcl13", "Mt1", "Saa3",
+  "Hacd4", "Il16", "Trem2", "Tgfbr2", "Slc9a9", "Tln2",
+  "Mgl2", "Gas6", "Csf1r",
+  "P2ry12", "Tmem119", "Sall1", "Hexb", "Siglech",
+  "Pf4", "Lyz2", "Apoe", "Mrc1", "Ms4a7", "Igf1",
+  "Folr2", "Clec10a", "P2rx7", "Cd163", "Lyve1", "C4b", "Colec12",
+  "H2-Aa", "Cd74", "Ccr2", "Fxyd5", "Cd52", "Coro1a", "Havcr2"
+)
+
+# All conditions
+norm_counts_all <- counts(dds, normalized = TRUE)
+sel_counts_all  <- norm_counts_all[hom_genes[hom_genes %in% rownames(norm_counts_all)], , drop = FALSE]
+
+mean_all <- sapply(unique(colData$combined1), function(cond) {
+  samples <- colData$Sample[colData$combined1 == cond]
+  rowMeans(sel_counts_all[, samples, drop = FALSE])
+})
+
+mean_df_all <- as.data.frame(t(mean_all))
+mean_df_all$Group <- rownames(mean_df_all)
+
+ggradar_all <- mean_df_all %>%
+  mutate(across(-Group, ~ log10(. + 1))) %>%
+  rename(group = Group)
+
+ggradar(
+  ggradar_all,
+  values.radar = c(0, 3, 7),
+  group.point.size = 2,
+  grid.mid = 3,
+  grid.max = 7,
+  group.line.width = 1,
+  group.colours = c("#00A9FF", "#182EB2", "#F8766D", "#B52B2B", "#7CAE00", "#34912D"),
+  legend.text.size = 10
+)
+
+ggsave(file.path(FIGURES_DIR, "radar_all_conditions.pdf"), width = 10, height = 8)
+
+# MG only
+filtered_col_mg <- colData %>% filter(combined1 %in% c("MG_BLZ_LPS", "MG_BLZ_CTL"))
+sel_counts_mg   <- sel_counts_all[, filtered_col_mg$Sample]
+
+mean_mg <- sapply(unique(filtered_col_mg$combined1), function(cond) {
+  samples <- filtered_col_mg$Sample[filtered_col_mg$combined1 == cond]
+  rowMeans(sel_counts_mg[, samples, drop = FALSE])
+})
+
+mean_df_mg <- as.data.frame(t(mean_mg))
+mean_df_mg$Group <- rownames(mean_df_mg)
+
+ggradar_mg <- mean_df_mg %>%
+  mutate(across(-Group, ~ log10(. + 1))) %>%
+  rename(group = Group)
+
+ggradar(
+  ggradar_mg,
+  values.radar = c(0, 3, 7),
+  group.point.size = 2,
+  grid.mid = 3,
+  grid.max = 7,
+  group.line.width = 1,
+  group.colours = c("#00A9FF", "#182EB2"),
+  legend.text.size = 10
+)
+
+ggsave(file.path(FIGURES_DIR, "radar_MG_LPS_vs_CTL.pdf"), width = 8, height = 8)
+
+# neg only
+filtered_col_neg <- colData %>% filter(combined1 %in% c("neg_BLZ_LPS", "neg_BLZ_CTL"))
+sel_counts_neg   <- sel_counts_all[, filtered_col_neg$Sample]
+
+mean_neg <- sapply(unique(filtered_col_neg$combined1), function(cond) {
+  samples <- filtered_col_neg$Sample[filtered_col_neg$combined1 == cond]
+  rowMeans(sel_counts_neg[, samples, drop = FALSE])
+})
+
+mean_df_neg <- as.data.frame(t(mean_neg))
+mean_df_neg$Group <- rownames(mean_df_neg)
+
+ggradar_neg <- mean_df_neg %>%
+  mutate(across(-Group, ~ log10(. + 1))) %>%
+  rename(group = Group)
+
+ggradar(
+  ggradar_neg,
+  values.radar = c(0, 3, 7),
+  group.point.size = 2,
+  grid.mid = 3,
+  grid.max = 7,
+  group.line.width = 1,
+  group.colours = c("#F8766D", "#B52B2B"),
+  legend.text.size = 10
+)
+
+ggsave(file.path(FIGURES_DIR, "radar_neg_LPS_vs_CTL.pdf"), width = 8, height = 8)
+
+# pos only
+filtered_col_pos <- colData %>% filter(combined1 %in% c("pos_BLZ_LPS", "pos_BLZ_CTL"))
+sel_counts_pos   <- sel_counts_all[, filtered_col_pos$Sample]
+
+mean_pos <- sapply(unique(filtered_col_pos$combined1), function(cond) {
+  samples <- filtered_col_pos$Sample[filtered_col_pos$combined1 == cond]
+  rowMeans(sel_counts_pos[, samples, drop = FALSE])
+})
+
+mean_df_pos <- as.data.frame(t(mean_pos))
+mean_df_pos$Group <- rownames(mean_df_pos)
+
+ggradar_pos <- mean_df_pos %>%
+  mutate(across(-Group, ~ log10(. + 1))) %>%
+  rename(group = Group)
+
+ggradar(
+  ggradar_pos,
+  values.radar = c(0, 3, 7),
+  group.point.size = 2,
+  grid.mid = 3,
+  grid.max = 7,
+  group.line.width = 1,
+  group.colours = c("#7CAE00", "#34912D"),
+  legend.text.size = 10
+)
+
+ggsave(file.path(FIGURES_DIR, "radar_pos_LPS_vs_CTL.pdf"), width = 8, height = 8)
+
+# ── 12. CTL-only radar (homeostatic markers) ──────────────────────────────────
+colData_CTL <- colData %>% filter(Condition == "CTL")
+count_CTL   <- count_filtered[, colData_CTL$Sample]
+
+dds_CTL <- DESeqDataSetFromMatrix(
+  countData = count_CTL,
+  colData   = colData_CTL,
+  design    = ~ combined1
+)
+
+dds_CTL <- DESeq(dds_CTL)
+
+norm_counts_CTL <- counts(dds_CTL, normalized = TRUE)
+
+ctl_genes <- c(
+  "P2ry12", "Tmem119", "Sall1", "Hexb", "Siglech",
+  "Pf4", "Lyz2", "Apoe", "Mrc1", "Ms4a7", "Igf1",
+  "Folr2", "Clec10a", "P2rx7", "Cd163", "Lyve1", "C4b", "Colec12",
+  "H2-Aa", "Cd74", "Ccr2", "Fxyd5", "Cd52", "Coro1a", "Havcr2"
+)
+
+ctl_counts_mat <- as.matrix(norm_counts_CTL[ctl_genes[ctl_genes %in% rownames(norm_counts_CTL)], , drop = FALSE])
+
+conditions_CTL <- unique(colData_CTL$combined1)
+
+mean_ctl <- sapply(conditions_CTL, function(cond) {
+  samples <- colData_CTL$Sample[colData_CTL$combined1 == cond]
+  rowMeans(ctl_counts_mat[, samples, drop = FALSE])
+})
+
+mean_df_ctl <- as.data.frame(t(mean_ctl))
+mean_df_ctl$Group <- rownames(mean_df_ctl)
+
+ggradar_ctl <- mean_df_ctl %>%
+  mutate(across(-Group, ~ . / max(., na.rm = TRUE))) %>%
+  rename(group = Group)
+
+ggradar(
+  ggradar_ctl,
+  values.radar = c(0, 0.5, 1.25),
+  group.point.size = 2,
+  grid.mid = 0.5,
+  grid.max = 1.25,
+  group.line.width = 1,
+  group.colours = c("#00A9FF", "#F8766D", "#7CAE00"),
+  legend.text.size = 10
+)
+
+ggsave(file.path(FIGURES_DIR, "radar_CTL_homeostatic_markers.pdf"), width = 10, height = 8)
+
+# ── 13. Bar plots – LPS-induced genes & highest difference from CTL ───────────
+common_LPS_genes <- Reduce(intersect, list(
+  rownames(res_mg)[res_mg$padj < 0.05 & res_mg$log2FoldChange > 0],
+  rownames(res_neg)[res_neg$padj < 0.05 & res_neg$log2FoldChange > 0],
+  rownames(res_pos)[res_pos$padj < 0.05 & res_pos$log2FoldChange > 0]
+))
+
+norm_counts_common <- counts(dds, normalized = TRUE)[common_LPS_genes, , drop = FALSE]
+
+mean_common <- data.frame(Gene = rownames(norm_counts_common))
+for (cond in unique(colData$combined1)) {
+  mean_common[[cond]] <- rowMeans(norm_counts_common[, colData$combined1 == cond, drop = FALSE])
+}
+
+mean_common$Higher_In <- colnames(mean_common)[-1][apply(mean_common[,-1], 1, which.max)]
+
+counts_summary <- mean_common %>%
+  group_by(Higher_In) %>%
+  summarise(Count = n()) %>%
+  ungroup()
+
+chi_test <- chisq.test(counts_summary$Count)
+p_chi <- format.pval(chi_test$p.value, digits = 2)
+
+condition_colors <- setNames(RColorBrewer::brewer.pal(n = nrow(counts_summary), "Set2"), counts_summary$Higher_In)
+
+p_bar <- ggplot(counts_summary, aes(x = Higher_In, y = Count, fill = Higher_In)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  labs(title = paste("Overlapping LPS genes – highest in each condition\nChi-square p =", p_chi),
+       x = "Condition", y = "Number of genes") +
+  scale_fill_manual(values = condition_colors) +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(FIGURES_DIR, "bar_LPS_highest_condition.pdf"), p_bar, width = 8, height = 6)
+
+# Highest LFC from CTL
+comparisons_lfc <- list(
+  MG   = c("MG_BLZ_LPS",   "MG_BLZ_CTL"),
+  neg  = c("neg_BLZ_LPS",  "neg_BLZ_CTL"),
+  pos  = c("pos_BLZ_LPS",  "pos_BLZ_CTL")
+)
+
+for (comp in names(comparisons_lfc)) {
+  cond_lps  <- comparisons_lfc[[comp]][1]
+  cond_ctl  <- comparisons_lfc[[comp]][2]
+  mean_common[[paste0(comp, "_LFC")]] <- log2((mean_common[[cond_lps]] + 1) / (mean_common[[cond_ctl]] + 1))
+}
+
+lfc_cols <- paste0(names(comparisons_lfc), "_LFC")
+mean_common$Max_LFC_Comp <- lfc_cols[apply(abs(mean_common[lfc_cols]), 1, which.max)]
+
+lfc_summary <- mean_common %>%
+  group_by(Max_LFC_Comp) %>%
+  summarise(Count = n()) %>%
+  ungroup()
+
+p_lfc_bar <- ggplot(lfc_summary, aes(x = Max_LFC_Comp, y = Count, fill = Max_LFC_Comp)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  labs(title = "Genes with highest LFC from CTL", x = "Comparison", y = "Number of genes") +
+  scale_fill_manual(values = condition_colors) +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(FIGURES_DIR, "bar_LPS_highest_LFC_from_CTL.pdf"), p_lfc_bar, width = 8, height = 6)
