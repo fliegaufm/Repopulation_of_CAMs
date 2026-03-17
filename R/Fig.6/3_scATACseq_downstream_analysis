@@ -1,0 +1,521 @@
+# =============================================================================
+# Project:   scATAC-seq – CAM repopulation in Mrc1CreERT2 R26tdT model
+# Script:    scATACseq_PostQC_CAM_Repop_Mrc1.R
+# Author:    MAximilian Fliegauf
+# Date:      11/2025
+# Purpose:   Load post-QC merged object → gene activity + label transfer →
+#            peak calling → differential accessibility → module scores →
+#            motif & chromVAR analysis → visualization (UMAPs, stacked bars,
+#            volcano, Venn, coverage plots, motif plots).
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Signac)
+  library(GenomeInfoDb)
+  library(EnsDb.Mmusculus.v79)
+  library(GenomicRanges)
+  library(ggplot2)
+  library(JASPAR2020)
+  library(TFBSTools)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  library(biovizBase)
+  library(reticulate)
+  library(scDblFinder)
+  library(Seurat)
+  library(dplyr)
+  library(Seqinfo)
+  library(Polychrome)
+  library(MetBrewer)
+  library(EnhancedVolcano)
+  library(VennDiagram)
+  library(glue)
+  library(viridis)
+  library(chromVAR)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(tibble)
+  library(SCpubr)
+  library(SeuratWrappers)
+  library(Matrix)
+  library(monocle3)
+  library(patchwork)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/scATACseq_Downstream_CAM_Repop_Mrc1.R")
+
+INPUT_RDS     <- here("results/objects/atac_called_peaks_and_RNA_Assay.rds")
+FIGURES_DIR   <- here("results/figures/scATAC_downstream")
+RDS_DIR       <- here("results/objects")
+
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(RDS_DIR,     recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load post-QC object ───────────────────────────────────────────────────
+atac_wpeaks <- readRDS(INPUT_RDS)
+cat("Loaded object:", dim(atac_wpeaks), "\n")
+
+DefaultAssay(atac_wpeaks) <- "peaks"
+
+# ── 2. UMAP visualizations ───────────────────────────────────────────────────
+pal_celltype <- met.brewer("Juarez", 9)
+names(pal_celltype) <- sort(unique(atac_wpeaks$cell_type), decreasing = TRUE)
+
+pdf(file.path(FIGURES_DIR, "umap_cell_type.pdf"), width = 8, height = 6)
+SCpubr::do_DimPlot(atac_wpeaks, group.by = "cell_type", colors.use = pal_celltype) + NoAxes()
+dev.off()
+
+pal_sample <- met.brewer("Thomas", 8, type = "discrete")
+names(pal_sample) <- sort(unique(atac_wpeaks$sample))
+
+pdf(file.path(FIGURES_DIR, "umap_by_sample.pdf"), width = 8, height = 6)
+SCpubr::do_DimPlot(atac_wpeaks, group.by = "sample", colors.use = pal_sample) + NoAxes()
+dev.off()
+
+pal_annotation <- met.brewer("Signac", 4)
+names(pal_annotation) <- sort(unique(atac_wpeaks$annotation))
+
+pdf(file.path(FIGURES_DIR, "umap_annotation.pdf"), width = 8, height = 6)
+SCpubr::do_DimPlot(atac_wpeaks, group.by = "annotation", colors.use = pal_annotation) + NoAxes()
+dev.off()
+
+pdf(file.path(FIGURES_DIR, "umap_clusters.pdf"), width = 8, height = 6)
+SCpubr::do_DimPlot(atac_wpeaks, group.by = "seurat_clusters") + NoAxes()
+dev.off()
+
+pdf(file.path(FIGURES_DIR, "umap_treatment.pdf"), width = 8, height = 6)
+SCpubr::do_DimPlot(atac_wpeaks, group.by = "treatment") + NoAxes()
+dev.off()
+
+# ── 3. Stacked bar plot – cell counts per cell type ─────────────────
+# Create contingency table
+tbl <- table(atac_wpeaks$cell_type, atac_wpeaks$treatment)
+
+# Convert to long format for ggplot
+df <- as.data.frame(tbl)
+colnames(df) <- c("cell_type", "treatment", "count")
+
+# Plot raw counts (stacked)
+pdf(file.path(FIGURES_DIR, "stacked_bar_raw_counts_treatment_per_celltype.pdf"), width = 10, height = 6)
+ggplot(df, aes(x = cell_type, y = count, fill = treatment)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Raw cell counts by treatment within each cell type",
+    x     = "Cell type",
+    y     = "Number of cells"
+  ) +
+  scale_fill_manual(values = c("BLZ" = "#E69F00", "V" = "#56B4E9"))   # same colors as your Venn
+dev.off()
+
+# ── 4. Differential accessibility – treatment comparison ──────────────────────
+DefaultAssay(atac_wpeaks) <- "called_peaks"
+
+compare_treatments <- function(object, celltype1, celltype2) {
+  message(glue("Comparing {celltype1} vs {celltype2}..."))
+  
+  markers <- FindMarkers(
+    object       = object,
+    ident.1      = celltype1,
+    ident.2      = celltype2,
+    only.pos     = FALSE,
+    min.pct      = 0.1,
+    logfc.threshold = 0.25,
+    test.use     = "LR",
+    latent.vars  = c("nCount_peaks")
+  )
+  
+  markers <- tibble::rownames_to_column(markers, "peak")
+  
+  gene_annotated <- ClosestFeature(object, regions = markers$peak) %>%
+    as.data.frame() %>%
+    dplyr::rename(peak = query_region)
+  
+  annotated <- left_join(markers, gene_annotated[, c("peak", "gene_name")], by = "peak") %>%
+    mutate(gene_label = ifelse(is.na(gene_name), peak, gene_name))
+  
+  p_volc <- EnhancedVolcano(
+    annotated,
+    lab       = annotated$gene_label,
+    x         = "avg_log2FC",
+    y         = "p_val_adj",
+    title     = glue("{celltype1} vs {celltype2}"),
+    subtitle  = "Differential chromatin accessibility",
+    pCutoff   = 0.05,
+    FCcutoff  = 0.5,
+    pointSize = 2.5,
+    labSize   = 1,
+    legendPosition = "right",
+    drawConnectors = FALSE,
+    shape     = 16,
+    col       = c("black", "black", "black", "red3")
+  )
+  
+  print(p_volc)
+  
+  return(annotated)
+}
+
+mg_treatment   <- compare_treatments(subset(atac_wpeaks, annotation == "MG"),  "BLZ", "V")
+cam_treatment  <- compare_treatments(subset(atac_wpeaks, annotation == "CAM"), "BLZ", "V")
+dm_treatment   <- compare_treatments(subset(atac_wpeaks, annotation == "DM"),  "BLZ", "V")
+mono_treatment <- compare_treatments(subset(atac_wpeaks, annotation == "Mono"),"BLZ", "V")
+
+# ── 5. Venn diagram  ────────────────────────────────
+venn_counts <- stack_data %>%
+  group_by(Segment) %>%
+  summarize(Count = unique(Count)) %>%
+  distinct()
+
+vals <- venn_counts$Count
+names(vals) <- venn_counts$Segment
+
+MG_only  <- vals["MG-only"]
+CAM_only <- vals["CAM-only"]
+DM_only  <- vals["DM-only"]
+
+MG_CAM   <- vals["MG∩CAM only"]
+MG_DM    <- vals["MG∩DM only"]
+CAM_DM   <- vals["CAM∩DM only"]
+
+MG_CAM_DM <- vals["MG∩CAM∩DM"]
+
+venn.plot <- draw.triple.venn(
+  area1 = MG_only + MG_CAM + MG_DM + MG_CAM_DM,          # MG
+  area2 = CAM_only + MG_CAM + CAM_DM + MG_CAM_DM,        # CAM
+  area3 = DM_only + MG_DM + CAM_DM + MG_CAM_DM,          # DM
+  
+  n12 = MG_CAM + MG_CAM_DM,   # MG ∩ CAM
+  n23 = CAM_DM + MG_CAM_DM,   # CAM ∩ DM
+  n13 = MG_DM + MG_CAM_DM,    # MG ∩ DM
+  
+  n123 = MG_CAM_DM,           # Triple overlap
+  
+  category = c("MG", "CAM", "DM"),
+  fill = c("#66c2a5", "#fc8d62", "#8da0cb"),
+  alpha = 0.6,
+  lwd = 2,
+  cex = 2,
+  cat.cex = 2
+)
+
+grid.newpage()
+grid.draw(venn.plot)
+
+dev.off()
+
+# ── 6. Module scores for CAM subtypes ─────────────────────────────────────────
+DefaultAssay(atac_wpeaks) <- "RNA_called_peaks"
+
+da_peaks_RNA <- FindAllMarkers(
+  atac_wpeaks,
+  test.use = "wilcox",
+  group.by = "annotation",
+  min.pct  = 0.3
+)
+
+DefaultAssay(atac_wpeaks) <- "called_peaks"
+
+da_peaks <- FindAllMarkers(
+  atac_wpeaks,
+  test.use = "wilcox",
+  group.by = "annotation",
+  min.pct  = 0.05
+)
+
+da_peaks_sig <- da_peaks[da_peaks$p_val_adj < 0.1, ]
+da_peaks_sig$peak <- rownames(da_peaks_sig)
+
+close_genes <- ClosestFeature(atac_wpeaks, da_peaks_sig$peak)
+da_peaks_sig$gene <- close_genes$gene_name[match(da_peaks_sig$peak, close_genes$query_region)]
+da_peaks_sig <- da_peaks_sig[!is.na(da_peaks_sig$gene), ]
+
+top_peaks <- da_peaks_sig %>%
+  group_by(cluster) %>%
+  slice_head(n = 300) %>%
+  ungroup()
+
+# Module gene lists (as original)
+hsc_cam_genes       <- c("Cd74", "H2-Aa", "H2-Ab1", "H2-Eb1", "Fxyd5", "Ciita", "Slamf7", "Slamf9", "Lgals3", "Cd226", "Alcam")
+ys_cam_genes        <- c("Timd4", "Colec12", "Cd209f", "Cd209g", "C4b", "Maf", "P2rx7", "Cd163")
+mg_marker_genes     <- c("Hexb", "Sall1", "Sparc", "Tmem119")
+cam_marker_genes    <- c("Mrc1", "Pf4", "Ms4a7", "Dab2", "F13a1", "Cd36")
+dm_marker_genes     <- c("Cd83", "H2-Aa", "Batf", "Ciita", "Cxcl13", "Slc41a2", "Cd93")
+mono_module         <- c("Ccr2", "Ly6c2", "Sell", "Cd177")
+repopulating_markers <- c("Zfp932", "Alcam", "Xylt1", "Atp10a", "Dscaml1", "Myo16", "Runx2",
+                          "Dhcr24", "Daam1", "Gosr2", "Trps1", "Creb5", "Racgap1", "Cd44",
+                          "Sycp2l", "Mrpl33", "Kcnd3")
+
+# Add module scores
+atac_wpeaks <- AddModuleScore(
+  atac_wpeaks,
+  features = list(hsc_cam_genes, ys_cam_genes, mg_marker_genes, cam_marker_genes,
+                  dm_marker_genes, mono_module, repopulating_markers),
+  name = c("hsc_cam_module", "ys_cam_module", "mg_module", "cam_module",
+           "dm_module", "mono_module", "repopulating_module")
+)
+
+# Plot modules with gene lists in subtitle
+modules <- c("hsc_cam_module1", "ys_cam_module2", "mg_module3",
+             "cam_module4", "dm_module5", "mono_module6", "repopulating_module7")
+
+module_genes <- list(
+  hsc_cam_module1     = hsc_cam_genes,
+  ys_cam_module2      = ys_cam_genes,
+  mg_module3          = mg_marker_genes,
+  cam_module4         = cam_marker_genes,
+  dm_module5          = dm_marker_genes,
+  mono_module6        = mono_module,
+  repopulating_module7 = repopulating_markers
+)
+
+pdf(file.path(FIGURES_DIR, "feature_plots_module_scores.pdf"), width = 12, height = 10)
+for (mod in modules) {
+  genes_text <- paste(module_genes[[mod]], collapse = ", ")
+  p <- FeaturePlot(
+    atac_wpeaks,
+    features = mod,
+    reduction = "umap",
+    pt.size = 0.7,
+    cols = viridis(100)
+  ) +
+    NoAxes() +
+    ggtitle(label = mod, subtitle = genes_text) +
+    theme(plot.title = element_text(hjust = 0.5, size = 14),
+          plot.subtitle = element_text(hjust = 0.5, size = 10))
+  print(p)
+}
+dev.off()
+
+# Heatmap of marker genes by cell type
+atac_wpeaks$cell_type <- factor(atac_wpeaks$cell_type,
+                                levels = c("homMG", "repopMG", "hom_ysCAM", "repop_ysCAM",
+                                           "hscCAM", "homDM", "repopDM", "hscDM", "clMonocyte"))
+
+Idents(atac_wpeaks) <- "cell_type"
+
+pdf(file.path(FIGURES_DIR, "heatmap_marker_genes.pdf"), width = 12, height = 10)
+DoHeatmap(
+  atac_wpeaks,
+  features = c(mg_marker_genes, cam_marker_genes, ys_cam_genes, hsc_cam_genes,
+               dm_marker_genes, mono_module),
+  group.colors = pal_celltype,
+  size = 3
+)
+dev.off()
+
+# ── 7. Coverage plots of marker & repopulation genes ──────────────────────────
+pdf(file.path(FIGURES_DIR, "coverage_plots_markers.pdf"), width = 12, height = 8)
+
+CoveragePlot(
+  atac_wpeaks,
+  group.by = "cell_type",
+  region = "Sall1",
+  region.highlight = GRanges("chr8", IRanges(start = 89042337, end = 89044320)),
+  extend.upstream = 10000,
+  extend.downstream = 2000,
+  annotation = TRUE,
+  peaks = TRUE
+)
+
+CoveragePlot(
+  atac_wpeaks,
+  group.by = "cell_type",
+  region = "Cd83",
+  region.highlight = GRanges("chr13", IRanges(start = 43805252, end = 43806146)),
+  extend.upstream = 10000,
+  extend.downstream = 4000,
+  annotation = TRUE,
+  peaks = TRUE
+)
+
+CoveragePlot(
+  atac_wpeaks,
+  group.by = "cell_type",
+  region = "Ms4a7",
+  region.highlight = GRanges("chr19", IRanges(start = 11320773, end = 11321583)),
+  extend.upstream = 10000,
+  extend.downstream = 2000,
+  annotation = TRUE,
+  peaks = TRUE
+)
+
+CoveragePlot(
+  atac_wpeaks,
+  group.by = "cell_type",
+  region = "H2-Aa",
+  region.highlight = GRanges("chr17", IRanges(start = 34280184, end = 34281585)),
+  extend.upstream = 10000,
+  extend.downstream = 2000,
+  annotation = TRUE,
+  peaks = TRUE
+)
+
+CoveragePlot(
+  atac_wpeaks,
+  group.by = "cell_type",
+  region = "Colec12",
+  region.highlight = GRanges("chr18", IRanges(start = 9707056, end = 9709088)),
+  extend.upstream = 10000,
+  extend.downstream = 2000,
+  annotation = TRUE,
+  peaks = TRUE
+)
+
+CoveragePlot(
+  atac_wpeaks,
+  group.by = "cell_type",
+  region = "Ly6c2",
+  region.highlight = GRanges("chr15", IRanges(start = 75111730, end = 75112243)),
+  extend.upstream = 10000,
+  extend.downstream = 2000,
+  annotation = TRUE,
+  peaks = TRUE
+)
+
+CoveragePlot(
+  atac_wpeaks,
+  group.by = "cell_type",
+  region = "Zfp932",
+  region.highlight = GRanges("chr5", IRanges(start = 109995973, end = 109997367)),
+  extend.upstream = 10000,
+  extend.downstream = 2000,
+  annotation = TRUE,
+  peaks = TRUE
+)
+
+dev.off()
+
+# ── 8. Motif analysis ─────────────────────────────────────────────────────────
+pfm <- getMatrixSet(x = JASPAR2020, opts = list(collection = "CORE", species = "Mus musculus", all_versions = FALSE))
+
+atac_wmotifs <- AddMotifs(
+  object = atac_wpeaks,
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  pfm    = pfm,
+  assay  = "called_peaks"
+)
+
+# Filter to standard chromosomes
+std_chrs <- paste0("chr", c(1:19, "X", "Y", "M"))
+atac_wmotifs <- subset(atac_wmotifs, features = rownames(atac_wmotifs)[seqnames(atac_wmotifs) %in% std_chrs])
+
+saveRDS(atac_wmotifs, file.path(RDS_DIR, "atac_with_motifs_SMALL.rds"))
+
+# Example differential motif enrichment (hscCAM vs hom_ysCAM)
+da_peaks_cam <- FindMarkers(
+  atac_wmotifs,
+  assay    = "called_peaks",
+  ident.1  = "hscCAM",
+  ident.2  = "hom_ysCAM"
+)
+
+da_peaks_cam_sig <- da_peaks_cam[da_peaks_cam$p_val_adj < 0.05, ]
+da_peaks_cam_sig$peak <- rownames(da_peaks_cam_sig)
+
+hsc_up <- da_peaks_cam_sig$peak[da_peaks_cam_sig$avg_log2FC > 0]
+hsc_up <- hsc_up[hsc_up %in% rownames(atac_wmotifs)]
+
+ys_up <- da_peaks_cam_sig$peak[da_peaks_cam_sig$avg_log2FC < 0]
+ys_up <- ys_up[ys_up %in% rownames(atac_wmotifs)]
+
+motifs_hsc <- if (length(hsc_up) > 0) FindMotifs(atac_wmotifs, features = hsc_up) else NULL
+motifs_ys  <- if (length(ys_up) > 0)  FindMotifs(atac_wmotifs, features = ys_up)  else NULL
+
+motif_results <- list(hscCAM_up = motifs_hsc, hom_ysCAM_up = motifs_ys)
+motif_results <- motif_results[!sapply(motif_results, is.null)]
+
+motif_enrichment <- do.call(rbind, lapply(names(motif_results), function(grp) {
+  df <- motif_results[[grp]] %>%
+    mutate(group = grp, neg_log_pvalue = -log10(pvalue))
+  df
+}))
+
+top_motifs <- motif_enrichment %>%
+  group_by(group) %>%
+  slice_max(order_by = neg_log_pvalue, n = 20) %>%
+  ungroup()
+
+pdf(file.path(FIGURES_DIR, "barplot_top_enriched_motifs.pdf"), width = 12, height = 8)
+ggplot(top_motifs,
+       aes(x = tidytext::reorder_within(motif.name, neg_log_pvalue, group),
+           y = neg_log_pvalue,
+           fill = fold.enrichment)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_wrap(~ group, scales = "free_y") +
+  scale_fill_viridis_c(option = "G", trans = "log10", name = "fold.enrichment") +
+  tidytext::scale_x_reordered() +
+  theme_minimal() +
+  labs(x = "Motif (TF)", y = "-log10(p-value)", title = "Top Enriched Motifs per Group")
+dev.off()
+
+# ── 9. chromVAR analysis ─────────────────────────────────────────────────────
+atac_chromvar <- RunChromVAR(object = atac_wmotifs, genome = BSgenome.Mmusculus.UCSC.mm10)
+
+DefaultAssay(atac_chromvar) <- "chromvar"
+
+avg_activity <- AggregateExpression(
+  atac_chromvar,
+  assays    = "chromvar",
+  group.by  = "cell_type",
+  slot      = "data"
+)
+
+# Differential chromVAR (example: hscCAM vs hom_ysCAM)
+chromvar_markers <- FindMarkers(
+  object   = atac_chromvar,
+  assay    = "chromvar",
+  ident.1  = "hscCAM",
+  ident.2  = "hom_ysCAM"
+)
+
+chromvar_markers$motif <- rownames(chromvar_markers)
+
+motif_object <- Motifs(atac_wmotifs)
+motif_name_df <- data.frame(
+  motif   = names(motif_object@motif.names),
+  TF_name = as.character(motif_object@motif.names),
+  stringsAsFactors = FALSE
+)
+
+chromvar_markers <- chromvar_markers %>%
+  left_join(motif_name_df, by = "motif")
+
+top_hsc <- chromvar_markers %>%
+  filter(p_val_adj < 0.005, avg_log2FC > 0) %>%
+  slice_min(order_by = p_val_adj, n = 10) %>%
+  mutate(group = "hscCAM")
+
+top_ys <- chromvar_markers %>%
+  filter(p_val_adj < 0.005, avg_log2FC < 0) %>%
+  slice_min(order_by = p_val_adj, n = 10) %>%
+  mutate(group = "hom_ysCAM")
+
+top_chromvar <- bind_rows(top_hsc, top_ys)
+
+pdf(file.path(FIGURES_DIR, "feature_plots_top_chromvar_motifs.pdf"), width = 12, height = 10)
+plots <- lapply(seq_along(top_chromvar$motif), function(i) {
+  FeaturePlot(
+    object   = atac_chromvar,
+    features = top_chromvar$motif[i],
+    cols     = mako(100)
+  ) +
+    NoAxes() +
+    ggtitle(top_chromvar$TF_name[i]) +
+    theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+})
+wrap_plots(plots, ncol = 3)
+dev.off()
+
+pdf(file.path(FIGURES_DIR, "motif_plot_top_chromvar.pdf"), width = 12, height = 8)
+MotifPlot(
+  object = atac_wmotifs,
+  motifs = top_chromvar$motif,
+  assay  = "called_peaks"
+)
+dev.off()
+
+sessionInfo()
