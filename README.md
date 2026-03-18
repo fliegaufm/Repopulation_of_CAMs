@@ -1,7 +1,9 @@
 # Repopulation_of_CAMs
 Code used to analyze data for "Distinct origins and niches determine the cellular responsiveness of CNS macrophages after repopulation"
+Fliegauf et al. 2026, Nature Immunology, doi: 10.1038/s41590-026-02457-y
 
-Its purpose is to provide an explanation for how to reproduce key findings of this publication.
+Its purpose is the reproducibility of the omics-based key findings of this publication.
+Generelly, for each dataset, the data and their associated metadata are necessary for the analysis.
 
 Users need to install R programming language. It can be downloaded from: https://cran.r-project.org/
 
