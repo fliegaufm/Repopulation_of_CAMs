@@ -1,0 +1,141 @@
+# =============================================================================
+# Project:   Stroke outcome – Corridor test (ordinal data) statistical analysis
+# Script:    stats_CorridorTest_Ordinal_BrunnerMunzel.R
+# Author:    Maximilian Fliegauf
+# Date:      10/2024
+# Purpose:   Load left/right corridor test scores + metadata → long format →
+#            Brunner–Munzel test per time point (non-parametric, robust to unequal
+#            variances) → Benjamini–Hochberg p-value adjustment 
+#            
+#            For final Plot, summary stats (IQR, median) and plotting function must be added
+#
+# Important notes:
+#   - Brunner–Munzel test used (more robust than Mann–Whitney U, no equal
+#     variance or location shift assumption)
+#   - p-value adjustment: Benjamini–Hochberg ("BH")
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(lawstat)       # brunner.munzel.test
+  library(ggplot2)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/stats_CorridorTest_Ordinal_BrunnerMunzel.R")
+
+LEFT_DATA_FILE  <- here("data/raw/Left_corridor.txt")
+RIGHT_DATA_FILE <- here("data/raw/Right_corridor.txt")
+METADATA_FILE   <- here("data/raw/colData.txt")
+
+FIGURES_DIR     <- here("results/figures/corridor_test")
+TABLES_DIR      <- here("results/tables/corridor_test")
+
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load & prepare left corridor data ──────────────────────────────────────
+samples_left <- read.table(
+  LEFT_DATA_FILE,
+  header = TRUE,
+  row.names = 1,
+  sep = "\t"
+)
+
+colData <- read.table(
+  METADATA_FILE,
+  header = TRUE,
+  sep = "\t"
+)
+
+# Reshape to long format
+sample_long_left <- samples_left %>%
+  rownames_to_column("Time_Point") %>%
+  pivot_longer(-Time_Point, names_to = "Subject", values_to = "Score")
+
+# Merge with metadata
+sample_data_left <- sample_long_left %>%
+  left_join(colData, by = "Subject")
+
+# ── 2. Brunner–Munzel test – Left corridor ────────────────────────────────────
+p_values_left <- list()
+
+time_points <- unique(sample_data_left$Time_Point)
+
+for (time in time_points) {
+  subset_data <- sample_data_left %>% filter(Time_Point == time)
+  
+  score_vehicle <- subset_data$Score[subset_data$Condition == "Vehicle"]
+  score_blz     <- subset_data$Score[subset_data$Condition == "BLZ"]
+  
+  test <- brunner.munzel.test(score_vehicle, score_blz)
+  p_values_left[[time]] <- test$p.value
+}
+
+# Adjust p-values (Benjamini–Hochberg)
+adjusted_p_left <- p.adjust(unlist(p_values_left), method = "BH")
+
+results_left <- data.frame(
+  Time_Point     = time_points,
+  Adjusted_P_Value = adjusted_p_left
+)
+
+write.table(
+  results_left,
+  file      = file.path(TABLES_DIR, "left_corridor_brunner_munzel_adjusted.txt"),
+  sep       = "\t",
+  quote     = FALSE,
+  row.names = FALSE
+)
+
+print("Left corridor – adjusted p-values:")
+print(results_left)
+
+# ── 3. Right corridor – repeat same workflow ──────────────────────────────────
+samples_right <- read.table(
+  RIGHT_DATA_FILE,
+  header = TRUE,
+  row.names = 1,
+  sep = "\t"
+)
+
+sample_long_right <- samples_right %>%
+  rownames_to_column("Time_Point") %>%
+  pivot_longer(-Time_Point, names_to = "Subject", values_to = "Score")
+
+sample_data_right <- sample_long_right %>%
+  left_join(colData, by = "Subject")
+
+# Brunner–Munzel per time point
+p_values_right <- list()
+
+for (time in time_points) {
+  subset_data <- sample_data_right %>% filter(Time_Point == time)
+  score_vehicle <- subset_data$Score[subset_data$Condition == "Vehicle"]
+  score_blz     <- subset_data$Score[subset_data$Condition == "BLZ"]
+  
+  test <- brunner.munzel.test(score_vehicle, score_blz)
+  p_values_right[[time]] <- test$p.value
+}
+
+adjusted_p_right <- p.adjust(unlist(p_values_right), method = "BH")
+
+results_right <- data.frame(
+  Time_Point     = time_points,
+  Adjusted_P_Value = adjusted_p_right
+)
+
+write.table(
+  results_right,
+  file      = file.path(TABLES_DIR, "right_corridor_brunner_munzel_adjusted.txt"),
+  sep       = "\t",
+  quote     = FALSE,
+  row.names = FALSE
+)
+
+print("Right corridor – adjusted p-values:")
+print(results_right)
+
+
+sessionInfo()
