@@ -1,5 +1,5 @@
 # =============================================================================
-# Project:   Bulk RNA-seq – LPS treatment in Ccr2-creERT2 × tdT model (Dura focus)
+# Project:   Bulk RNA-seq of dCAMs – LPS treatment in Ccr2-creERT2 R26tdT line
 # Script:    bulkRNAseq_LPS_Ccr2_Dura_analysis.R
 # Author:    Maximilian Fliegauf
 # Date:      08/2025
@@ -56,19 +56,8 @@ colData_dura <- colData_dura %>%
     combined1 = factor(paste0(cell_type, "_", combined))
   )
 
-# ── 2. Subset to D_pos / D_neg only ──────────────────────────────────────────
-colData_dura_filtered <- colData_dura %>%
-  filter(cell_type %in% c("D_pos", "D_neg"))
-
-colData_dura_filtered$combined1 <- droplevels(colData_dura_filtered$combined1)
-
-counts_dura_filtered <- counts_dura[, colData_dura_filtered$Sample]
-
-# Sanity check
-stopifnot(all(colnames(counts_dura_filtered) == colData_dura_filtered$Sample))
-
 # ── 3. Quality Control ───────────────────────────────────────────────────────
-total_counts <- colSums(counts_dura_filtered)
+total_counts <- colSums(counts_dura)
 summary(total_counts)
 
 pdf(file.path(FIGURES_DIR, "library_sizes_dura.pdf"), width = 10, height = 6)
@@ -77,7 +66,7 @@ barplot(total_counts, main = "Library Sizes Smart-3 Seq Ccr2creERT2×tdT LPS (Du
 dev.off()
 
 # Filter low-expressed genes (≥10 counts in ≥ half of samples)
-counts_dura_filtered <- counts_dura_filtered[rowSums(counts_dura_filtered > 10) >= ncol(counts_dura_filtered)/2, ]
+counts_dura_filtered <- counts_dura[rowSums(counts_dura > 10) >= ncol(counts_dura)/2, ]
 detected_genes <- counts_dura[rowSums(counts_dura > 1) >= 1, ]
 
 cat("Genes after low-count filter:", nrow(counts_dura_filtered), "\n")
@@ -126,7 +115,7 @@ design_formula <- ~ combined + cell_type
 
 dds <- DESeqDataSetFromMatrix(
   countData = counts_dura_filtered,
-  colData   = colData_dura_filtered,
+  colData   = colData_dura,
   design    = design_formula
 )
 
@@ -158,8 +147,8 @@ gene_variances <- apply(vsd_mat, 1, var)
 top_variable_genes <- order(gene_variances, decreasing = TRUE)[1:500]
 vsd_mat_top <- vsd_mat[top_variable_genes, ]
 
-annotation_col <- as.data.frame(colData_dura_filtered[, c("combined", "cell_type"), drop = FALSE])
-rownames(annotation_col) <- colData_dura_filtered$Sample
+annotation_col <- as.data.frame(colData_dura[, c("combined", "cell_type"), drop = FALSE])
+rownames(annotation_col) <- colData_dura$Sample
 
 annotation_colors <- list(
   cell_type = c("D_pos" = "#FF994E", "D_neg" = "#B66DFF"),
@@ -188,7 +177,7 @@ design_formula_lps <- ~ combined1
 
 dds_lps <- DESeqDataSetFromMatrix(
   countData = counts_dura_filtered,
-  colData   = colData_dura_filtered,
+  colData   = colData_dura,
   design    = design_formula_lps
 )
 
@@ -249,7 +238,7 @@ ggsave(file.path(FIGURES_DIR, "volcano_dura_pos_vs_neg_LPS.pdf"), p_volc_neg_vs_
 LPS_neg_vs_pos <- lfc_shrink_neg_vs_pos
 
 # ── 9. CTL-only analysis (D_pos vs D_neg) ─────────────────────────────────────
-colData_CAM_CTL <- colData_dura_filtered[colData_dura_filtered$Condition == "CTL", ]
+colData_CAM_CTL <- coldata_dura[coldata_dura$Condition == "CTL", ]
 count_filt_CAM_CTL <- counts_dura_filtered[, colnames(counts_dura_filtered) %in% colData_CAM_CTL$Sample]
 
 design_formula_CTL <- ~ cell_type
@@ -315,8 +304,8 @@ transposed_mat <- t(mat_df)
 scaled_mat <- scale(transposed_mat, center = TRUE, scale = TRUE)
 scaled_mat <- t(scaled_mat)
 
-annotation_col <- as.data.frame(colData_dura_filtered[, c("combined", "cell_type"), drop = FALSE])
-rownames(annotation_col) <- colData_dura_filtered$Sample
+annotation_col <- as.data.frame(coldata_dura[, c("combined", "cell_type"), drop = FALSE])
+rownames(annotation_col) <- coldata_dura$Sample
 
 annotation_colors <- list(
   cell_type = c("D_pos" = "#FF994E", "D_neg" = "#B66DFF"),
@@ -409,8 +398,8 @@ lps_genes <- c(
 
 sel_counts <- normalized_counts[lps_genes[lps_genes %in% rownames(normalized_counts)], , drop = FALSE]
 
-mean_expression <- sapply(unique(colData_dura_filtered$combined1), function(cond) {
-  samples <- colData_dura_filtered$Sample[colData_dura_filtered$combined1 == cond]
+mean_expression <- sapply(unique(coldata_dura$combined1), function(cond) {
+  samples <- coldata_dura$Sample[coldata_dura$combined1 == cond]
   rowMeans(sel_counts[, samples, drop = FALSE])
 })
 
