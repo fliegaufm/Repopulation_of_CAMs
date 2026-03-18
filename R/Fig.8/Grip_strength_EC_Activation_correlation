@@ -1,0 +1,176 @@
+# =============================================================================
+# Project:   Stroke outcome correlation – Psel signal vs. left grip strength deficit on +1d
+# Script:    correlation_Psel_GripStrength_StrokeOutcome.R
+# Author:    Maximilian Fliegauf
+# Date:      10/2024
+# Purpose:   Load grip strength & Psel data → normality checks (Q-Q + Shapiro) 
+#            → Spearman correlation →
+#            linear regression with 95% confidence & prediction intervals →
+#            plot stratified by treatment (Vehicle vs BLZ).
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(lawstat)
+  library(ggplot2)
+})
+
+# ── Paths & Parameters ───────────────────────────────────────────────────────
+here::i_am("analysis/correlation_Psel_GripStrength_StrokeOutcome.R")
+
+DATA_FILE    <- here("data/raw/Grip_Psel_correl.txt")
+FIGURES_DIR  <- here("results/figures/correlation")
+TABLES_DIR   <- here("results/tables/correlation")
+
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+
+# ── 1. Load data ─────────────────────────────────────────────────────────────
+samples <- read.table(
+  DATA_FILE,
+  header = TRUE,
+  row.names = NULL,
+  sep = "\t"
+)
+
+# Ensure Treatment is factor with correct levels
+samples$Treatment <- factor(samples$Treatment, levels = c("Vehicle", "BLZ"))
+
+cat("Loaded dataset:", dim(samples), "\n")
+print(head(samples))
+
+# ── 2. Normality checks (before outlier removal) ──────────────────────────────
+pdf(file.path(FIGURES_DIR, "qq_plots_before_outlier_removal.pdf"), width = 10, height = 5)
+par(mfrow = c(1,2))
+
+qqnorm(samples$Left_grip_strength_deficit, main = "Q-Q: Left Grip Strength Deficit")
+qqline(samples$Left_grip_strength_deficit, col = "blue")
+
+qqnorm(samples$Psel_signal, main = "Q-Q: Psel Signal")
+qqline(samples$Psel_signal, col = "blue")
+
+dev.off()
+
+# Shapiro-Wilk tests
+cat("Shapiro-Wilk normality test (before outlier removal):\n")
+print(shapiro.test(samples$Left_grip_strength_deficit))
+print(shapiro.test(samples$Psel_signal))
+
+# ── 3. Outlier removal ────────────────────────────────────────────────────────
+
+cat("Removed 1 outlier. Remaining rows:", nrow(samples), "\n")
+
+# Normality checks after removal
+pdf(file.path(FIGURES_DIR, "qq_plots_after_outlier_removal.pdf"), width = 10, height = 5)
+par(mfrow = c(1,2))
+
+qqnorm(samples$Left_grip_strength_deficit, main = "Q-Q: Left Grip Strength Deficit (clean)")
+qqline(samples$Left_grip_strength_deficit, col = "blue")
+
+qqnorm(samples$Psel_signal, main = "Q-Q: Psel Signal (clean)")
+qqline(samples$Psel_signal, col = "blue")
+
+dev.off()
+
+cat("Shapiro-Wilk normality test (after outlier removal):\n")
+print(shapiro.test(samples$Left_grip_strength_deficit))
+print(shapiro.test(samples$Psel_signal))
+
+# ── 4. Spearman correlation & linear model ────────────────────────────────────
+spearman_corr <- cor(
+  samples$Left_grip_strength_deficit,
+  samples$Psel_signal,
+  method = "spearman"
+)
+
+cat("Spearman correlation coefficient:", round(spearman_corr, 3), "\n")
+
+# Linear model
+model <- lm(Left_grip_strength_deficit ~ Psel_signal, data = samples)
+
+# Predictions with confidence & prediction intervals
+new_data <- data.frame(Psel_signal = samples$Psel_signal)
+
+predictions <- predict(model, newdata = new_data, interval = "predict")
+confidence_intervals <- predict(model, newdata = new_data, interval = "confidence")
+
+new_data$fit       <- predictions[, "fit"]
+new_data$conf_lower <- confidence_intervals[, "lwr"]
+new_data$conf_upper <- confidence_intervals[, "upr"]
+new_data$pred_lower <- predictions[, "lwr"]
+new_data$pred_upper <- predictions[, "upr"]
+
+# ── 5. Publication-quality plot ──────────────────────────────────────────────
+pdf(file.path(FIGURES_DIR, "correlation_Psel_vs_GripStrength.pdf"), width = 8, height = 6)
+
+ggplot(samples, aes(x = Psel_signal, y = Left_grip_strength_deficit, color = Treatment)) +
+  # Confidence interval ribbon
+  geom_ribbon(
+    data = new_data,
+    aes(x = Psel_signal, ymin = conf_lower, ymax = conf_upper, fill = "Confidence Interval"),
+    alpha = 0.5,
+    inherit.aes = FALSE
+  ) +
+  # Prediction interval ribbon
+  geom_ribbon(
+    data = new_data,
+    aes(x = Psel_signal, ymin = pred_lower, ymax = pred_upper, fill = "Prediction Interval"),
+    alpha = 0.3,
+    inherit.aes = FALSE
+  ) +
+  # Regression line
+  geom_line(
+    data = new_data,
+    aes(x = Psel_signal, y = fit),
+    color = "red",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  # Data points
+  geom_point(size = 5) +
+  # Colors & fills
+  scale_fill_manual(
+    name   = "Intervals",
+    values = c("Confidence Interval" = "lightblue", "Prediction Interval" = "lightgray")
+  ) +
+  scale_color_manual(
+    name   = "Treatment",
+    values = c("BLZ" = "black", "Vehicle" = "darkgrey")
+  ) +
+  # Labels & theme
+  labs(
+    title = "Regression: Psel Signal vs. Left Grip Strength Deficit",
+    x     = "Psel Signal",
+    y     = "Left Grip Strength Deficit (%)"
+  ) +
+  # Spearman annotation (top-right)
+  annotate(
+    "text",
+    x = max(samples$Psel_signal, na.rm = TRUE) * 0.7,
+    y = max(samples$Left_grip_strength_deficit, na.rm = TRUE) * 0.9,
+    label = paste0("Spearman ρ = ", round(spearman_corr, 2)),
+    size = 5,
+    color = "black",
+    hjust = 0.5,
+    vjust = -8
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+dev.off()
+
+# ── 6. Save cleaned data (optional) ───────────────────────────────────────────
+write.table(
+  samples,
+  file      = file.path(TABLES_DIR, "grip_psel_cleaned.txt"),
+  sep       = "\t",
+  quote     = FALSE,
+  row.names = FALSE
+)
+
+cat("Plot & cleaned data saved.\n")
+cat("Correlation plot:", file.path(FIGURES_DIR, "correlation_Psel_vs_GripStrength.pdf"), "\n")
+
+sessionInfo()
