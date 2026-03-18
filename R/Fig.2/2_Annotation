@@ -10,12 +10,16 @@
 #            run Harmony integration, and produce final annotated object.
 #
 # Important notes:
-#   - All manual annotation decisions are preserved and clearly documented.
+#   - Before applying this code, a standard QC was performed for both experimental runs 
+#     with nFeatureRNA > 200 & nFeatureRNA < 6000 & percent.mt < 10
+#     Additionally, scDblFinder was run and all suspected doublets removed -> Run such a QC before this script for all samples
+#   - All manual annotation decisions are shown
 #   - Interactive CellSelector steps are marked — run once, then save object.
 #   - Subclustering (immune, fibro, PC) is kept in one file for traceability,
-#     but can be split later if desired.
+#     but can be split if desired
 #   - Annotation is defined by subclustering similar cell types and annotating 
-#     them by markers for subtypes from relevant literature
+#     them by markers for subtypes from relevant literature (Vanlandewijck et al., 
+#     Pietilä et al., Rustenhoven et al., Amann et al., Masuda et al. and other)
 # =============================================================================
 
 suppressPackageStartupMessages({
